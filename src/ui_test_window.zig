@@ -1,8 +1,10 @@
 //! The frame around every page: the sidebar beside it, its fold, and where
 //! the page starts once the sidebar's width settles.
 const std = @import("std");
-const ui = @import("nanoui").ui;
+const nanoui = @import("nanoui");
+const ui = nanoui.ui;
 const config = @import("config.zig");
+const theme = @import("theme.zig");
 const ui_test = @import("ui_test.zig");
 
 const Fixture = ui_test.Fixture;
@@ -11,6 +13,15 @@ const Fixture = ui_test.Fixture;
 fn bodyX(t: *ui.Tester) ?f32 {
     for (t.ctx.nodes.items) |n| {
         if (n.style.scroll and n.style.grow > 0.5) return n.rect.x;
+    }
+    return null;
+}
+
+/// The background of the column at the left edge: the sidebar, folded or not.
+fn railBackground(t: *ui.Tester) ?ui.Color {
+    for (t.ctx.nodes.items) |n| {
+        if (n.rect.x != 0 or n.rect.y != 0 or n.rect.w >= 300) continue;
+        if (n.style.background) |bg| return bg;
     }
     return null;
 }
@@ -64,7 +75,10 @@ test "the sidebar folds to a rail, and the fold is remembered" {
     // The rail keeps the icons alone, and the page starts beside it.
     try std.testing.expect(!t.hasText("Settings"));
     try std.testing.expect(!t.hasText("0 of 1 ready"));
-    try std.testing.expectApproxEqAbs(@as(f32, 65), bodyX(&t).?, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 64), bodyX(&t).?, 0.01);
+    // Folded, the rail takes the page's color: one surface, not two.
+    const k = theme.colors(nanoui.isDark());
+    try std.testing.expect(std.meta.eql(railBackground(&t) orelse return error.NoRail, k.page));
 
     // The fold is remembered across runs.
     const saved = try config.load(a, std.testing.io, f.app.data_dir);
@@ -75,5 +89,6 @@ test "the sidebar folds to a rail, and the fold is remembered" {
     t.settle(1);
     try std.testing.expect(t.hasText("Settings"));
     try std.testing.expectApproxEqAbs(@as(f32, 221), bodyX(&t).?, 0.01);
+    // Open again, the sidebar has its own shade.
+    try std.testing.expect(std.meta.eql(railBackground(&t) orelse return error.NoRail, k.sidebar));
 }
-

@@ -1,6 +1,7 @@
 //! nanomcp's window: a sidebar of pages with a figure beside each, and the
 //! page: servers, the market, the routes, the tools, and settings.
 const std = @import("std");
+const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -18,6 +19,10 @@ const server_dialogs = @import("server_dialogs.zig");
 const gateway_views = @import("gateway_views.zig");
 const App = state_mod.App;
 
+/// On macOS the title bar is hidden and the window's own colors run to its
+/// top edge; this strip is where the traffic lights sit, and the sidebar's
+/// header starts below it. It matches the page header's height.
+pub const title_bar_h: f32 = 54;
 const sidebar_width: f32 = 220;
 const sidebar_rail: f32 = 64;
 const sidebar_tile: f32 = 32;
@@ -26,6 +31,9 @@ pub fn view(s: *App, c: *ui.Context) void {
     const dark = nanoui.isDark();
     c.theme = theme.ui(dark);
     const k = theme.colors(dark);
+    // The strip at the top moves the window as a title bar does, and its
+    // empty space is left for the window's buttons.
+    if (builtin.os.tag == .macos) c.title_bar_height = title_bar_h;
 
     // A server's row menu belongs to the page that opened it: going elsewhere
     // leaves no menu hanging over the new page. Dialogs stay: they can be
@@ -36,7 +44,10 @@ pub fn view(s: *App, c: *ui.Context) void {
     const root = ui.div(c).row().sizeFull().bg(k.page);
     defer root.end();
     sidebar(c, s, k);
-    _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.separator }, .none, null);
+    // Folded, the rail is the page itself: no border marks where it ends.
+    if (!s.cfg.sidebar_collapsed) {
+        _ = c.leaf(.{ .width = .{ .px = 1 }, .height = .fill, .background = k.separator }, .none, null);
+    }
     {
         const main = ui.div(c).column().grow().w(0).hFull().clip();
         defer main.end();
@@ -74,8 +85,13 @@ pub fn view(s: *App, c: *ui.Context) void {
 /// page, folded to a rail when the user asks.
 fn sidebar(c: *ui.Context, s: *App, k: theme.Colors) void {
     const folded = s.cfg.sidebar_collapsed;
-    var col = ui.div(c).column().hFull().bg(k.sidebar).py(8).gap(6);
+    // Folded, the rail is the page's own color, so the window reads as one
+    // surface rather than a strip beside it.
+    var col = ui.div(c).column().hFull().bg(if (folded) k.page else k.sidebar).pb(8).gap(6);
     col = if (folded) col.px(6) else col.px(10);
+    // The sidebar runs under the traffic lights, so its own header starts
+    // below the strip they sit in.
+    col = if (builtin.os.tag == .macos) col.pt(title_bar_h) else col.py(8);
     // The fold eases between the two widths, so the page beside it does not
     // jump.
     const target: f32 = if (folded) sidebar_rail else sidebar_width;

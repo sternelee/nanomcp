@@ -7,6 +7,7 @@
 //! right-click context menu (with its Connect and Disconnect entries) and no
 //! status-bar panel with tabs, so those cases do not exist here.
 const std = @import("std");
+const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const config = @import("config.zig");
@@ -20,6 +21,7 @@ const editor = @import("editor.zig");
 const page_servers = @import("page_servers.zig");
 const server_views = @import("server_views.zig");
 const view = @import("view.zig").view;
+const view_mod = @import("view.zig");
 
 const App = state.App;
 
@@ -494,6 +496,26 @@ test "an oauth server is offered connect" {
 
     try std.testing.expect(t.hasText("Connect"));
     try std.testing.expect(findSwitch(&t) != null);
+}
+
+test "the window leaves a title bar strip for the traffic lights" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const f = try Fixture.init(a, &.{});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try openWindow(&t, f, a);
+    defer t.deinit();
+
+    // The strip is a title bar's height, and the view tells nanoui to treat
+    // its empty space as one.
+    try std.testing.expectEqual(view_mod.title_bar_h, t.ctx.title_bar_height);
+    // The brand row starts below it, clear of the window's buttons.
+    const brand = findTextNth(&t, "nanomcp", 0) orelse return error.TextNotFound;
+    try std.testing.expect(brand.y >= view_mod.title_bar_h);
 }
 
 test "the sidebar navigates to tools" {

@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 const state_mod = @import("state.zig");
 const view = @import("view.zig");
+const theme = @import("theme.zig");
 const menubar = @import("menubar.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -49,6 +50,10 @@ fn newMainWindow(app: *nanoui.App, state: *state_mod.App) !*nanoui.Window {
         .height = 740,
         .min_width = 820,
         .min_height = 560,
+        // The sidebar and the page run to the window's top edge; the window's
+        // own buttons sit over the sidebar's strip, as nanoterm's do.
+        .title_bar = if (builtin.os.tag == .macos) .hidden else .default,
+        .theme = theme.ui(nanoui.isDark()),
         // The close button hides the window; the menu bar and the Dock icon
         // show it again.
         .should_close = .{ .ctx = state, .func = hideOnClose },

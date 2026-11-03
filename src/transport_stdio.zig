@@ -65,10 +65,28 @@ pub const Stdio = struct {
         } else if (env.len > 0) {
             env_map = std.process.Environ.Map.init(a);
         }
+        var own_path: ?[]u8 = null;
+        defer if (own_path) |p| a.free(p);
         if (env_map) |*m| {
             for (env) |pair| {
                 const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
                 try m.put(pair[0..eq], pair[eq + 1 ..]);
+            }
+            own_path = try childPath(a, m.get("PATH") orelse "", m.get("HOME"));
+            try m.put("PATH", own_path.?);
+        }
+
+        // A command with no slash is a name for PATH to resolve. Resolving it
+        // here uses the PATH the child is given, not this process's, so a
+        // server configured on a GUI launch can still start.
+        var resolved: ?[]u8 = null;
+        defer if (resolved) |r| a.free(r);
+        if (comptime builtin.os.tag != .windows) {
+            if (own_path) |p| {
+                if (std.mem.indexOfScalar(u8, command, '/') == null) {
+                    resolved = try resolveCommand(a, io, command, p);
+                    if (resolved) |r| argv[0] = r;
+                }
             }
         }
 
@@ -282,6 +300,66 @@ fn copyEnv(a: std.mem.Allocator, parent: *const std.process.Environ.Map) !std.pr
     return out;
 }
 
+fn onPath(path: []const u8, dir: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry, dir)) return true;
+    }
+    return false;
+}
+
+/// Directories a login shell has on PATH but a Finder launch does not: an app
+/// opened from the Dock gets "/usr/bin:/bin:/usr/sbin:/sbin", so a server
+/// configured as `npx -y ...` could not even be found. They are appended, so
+/// whatever the app was started with still takes precedence.
+const fallback_path_dirs = [_][]const u8{
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+};
+
+fn childPath(a: std.mem.Allocator, incoming: []const u8, home: ?[]const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, incoming);
+    for (fallback_path_dirs) |dir| {
+        if (onPath(out.items, dir)) continue;
+        if (out.items.len > 0 and out.items[out.items.len - 1] != ':') try out.append(a, ':');
+        try out.appendSlice(a, dir);
+    }
+    if (home) |h| {
+        if (h.len > 0) {
+            const local = try std.fs.path.join(a, &.{ h, ".local", "bin" });
+            defer a.free(local);
+            if (!onPath(out.items, local)) {
+                if (out.items.len > 0 and out.items[out.items.len - 1] != ':') try out.append(a, ':');
+                try out.appendSlice(a, local);
+            }
+        }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Finds `command` on `path` when it is a bare name. The spawn options'
+/// environ_map does not take part in argv[0] resolution, so with a GUI
+/// launch's PATH a name like `npx` would never be found without this.
+fn resolveCommand(a: std.mem.Allocator, io: Io, command: []const u8, path: []const u8) !?[]u8 {
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |dir| {
+        const candidate = try std.fs.path.join(a, &.{ dir, command });
+        if (std.Io.Dir.cwd().access(io, candidate, .{ .execute = true })) |_| {
+            return candidate;
+        } else |_| {}
+        a.free(candidate);
+    }
+    return null;
+}
+
 test "a line longer than the cap is dropped, and the next one is still read" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -362,6 +440,58 @@ test "two threads writing to the child do not interleave their lines" {
     }
     try std.testing.expectEqual(@as(usize, 100), seen_a);
     try std.testing.expectEqual(@as(usize, 100), seen_b);
+}
+
+test "a GUI launch's bare PATH gains the usual install directories" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const path = try childPath(a, "/usr/bin:/bin", "/Users/someone");
+    try std.testing.expect(std.mem.startsWith(u8, path, "/usr/bin:/bin:"));
+    try std.testing.expect(onPath(path, "/opt/homebrew/bin"));
+    try std.testing.expect(onPath(path, "/usr/local/bin"));
+    try std.testing.expect(onPath(path, "/Users/someone/.local/bin"));
+    // What was already there is not listed twice.
+    try std.testing.expectEqual(@as(usize, 1), countPathEntries(path, "/usr/bin"));
+    try std.testing.expectEqual(@as(usize, 1), countPathEntries(path, "/bin"));
+}
+
+test "a bare command resolves through the configured PATH, not the app's" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "nanomcp-probe",
+        .data = "#!/bin/sh\nprintf 'resolved\\n'\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+    const dir_path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+
+    var parent: std.process.Environ.Map = .init(a);
+    defer parent.deinit();
+    try parent.put("PATH", dir_path);
+
+    const s = try Stdio.start(a, std.testing.io, "nanomcp-probe", &.{}, &.{}, &parent);
+    defer s.deinit();
+
+    var buf: [256]u8 = undefined;
+    var reader = s.child.stdout.?.readerStreaming(std.testing.io, &buf);
+    const line = (try reader.interface.takeDelimiter('\n')) orelse return error.NoOutput;
+    try std.testing.expectEqualStrings("resolved", line);
+}
+
+fn countPathEntries(path: []const u8, entry: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, path, ':');
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e, entry)) n += 1;
+    }
+    return n;
 }
 
 test "a stdio server gets the app environment with its own values on top" {

@@ -1,4 +1,4 @@
-//! nanomcp's tests: behavior kept from the Go original, plus the modules that
+//! nanomcp's tests: the behaviour each module promises, plus the modules that
 //! only have inline tests.
 const std = @import("std");
 

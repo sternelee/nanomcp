@@ -1,4 +1,4 @@
-//! The settings tests the Go original had, kept as they behaved.
+//! The settings tests: loading, saving, and what each field may hold.
 const std = @import("std");
 const config = @import("config.zig");
 

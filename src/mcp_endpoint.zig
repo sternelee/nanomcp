@@ -91,8 +91,8 @@ pub fn notifyToolsChanged(g: *gateway_mod.Gateway) void {
 
 /// Answers a streamable HTTP request: one JSON-RPC message in, one out.
 pub fn handle(g: *gateway_mod.Gateway, req: *server.Request) !void {
-    // A client that is done with its session ends it, as the Go gateway's
-    // server unregisters a session that goes away.
+    // A client that is done with its session ends it, and the session is
+    // unregistered as it goes away.
     if (req.method == .DELETE) {
         if (req.header("mcp-session-id")) |id| {
             if (g.routes.remove(req.a, id)) |who| {

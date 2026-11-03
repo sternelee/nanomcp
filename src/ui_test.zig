@@ -1,13 +1,11 @@
-//! The Go original's UI tests, ported: the same behaviour, the same
-//! assertions, against the real widgets instead of a terminal, run
-//! offscreen by nanoui's tester (see the repository's AGENTS.md: native UI
-//! is tested with `ui.Tester`, never by opening a window).
+//! The UI tests: the behaviour the real widgets promise, run offscreen by
+//! nanoui's tester (native UI is tested with `ui.Tester`, never by opening a
+//! window).
 //!
-//! The Go tests build an app with a gateway and a credential store and no
-//! window; this does the same, by hand, the way the gateway's own tests do.
-//! Two things the Go tests had are missing from this UI, so the cases that
-//! need them are not ported: the right-click context menus (the Connect and
-//! Disconnect entries), and the status-bar panel with its tabs.
+//! Each test builds an app with a gateway and a credential store and no
+//! window, by hand, the way the gateway's own tests do. This UI has no
+//! right-click context menu (with its Connect and Disconnect entries) and no
+//! status-bar panel with tabs, so those cases do not exist here.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -42,11 +40,11 @@ fn clickSwitch(t: *ui.Tester) !void {
     t.click(r.x + r.w / 2, r.y + r.h / 2);
 }
 
-/// The window the Go tests open.
+/// The window these tests open.
 const window_w: f32 = 1080;
 const window_h: f32 = 740;
 
-/// The standard-library server the Go tests start from.
+/// The standard-library server these tests start from.
 pub fn stdioServer() config.ServerConfig {
     return .{
         .id = "s1",
@@ -59,7 +57,7 @@ pub fn stdioServer() config.ServerConfig {
     };
 }
 
-/// The Go tests' remote server: HTTP, with a static bearer token.
+/// The remote server these tests use: HTTP, with a static bearer token.
 pub fn remoteServer() config.ServerConfig {
     return .{
         .id = "s1",
@@ -148,7 +146,7 @@ fn openWindowWith(t: *ui.Tester, f: *Fixture, a: std.mem.Allocator, opts: ui.Tes
     try t.init(a, .init(&f.app, view), options);
 }
 
-/// A tester over the whole window, as the Go tests open one.
+/// A tester over the whole window.
 pub fn openWindow(t: *ui.Tester, f: *Fixture, a: std.mem.Allocator) !void {
     try openWindowWith(t, f, a, .{});
 }

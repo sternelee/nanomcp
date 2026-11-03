@@ -1,448 +1,417 @@
-# mcp-go → nanoui (Zig) 重写笔记
+# nanomcp 设计说明
 
-Task list in this repo's session: #1 read sources (in progress), #2 skeleton,
-#3 config, #4 MCP protocol/transports, #5 gateway+auth, #6 registry, #7 UI,
-#8 port tests, #9 build/test verification.
+一个带窗口的 MCP 网关：把多个 MCP 服务器聚合到一个端点、一份工具列表、一份调用记录；
+五页界面，三种上游 transport，上游 OAuth，自建 OAuth 授权服务器，Market registry 搜索、
+配置导入与菜单栏。
 
-## User decisions (ask_user, m00070)
-- Location: nanoui 仓库 `apps/` 目录下（新增 `apps/mcp-go`，参照 nanoterm 结构）
-- Scope: 一次性全量重写（五页 UI、三种 transport、上游 OAuth、自建 OAuth 授权服务器、
-  Market registry 搜索、导入、菜单栏）
-- Tests: 移植对应测试（Go 版约 450 个测试函数：main_test.go 1,742 行 UI 测试 +
-  internal 各包测试）用 ui.Tester / std.testing 保持行为等价
+- 平台：macOS、Linux、Windows；nanoui 0.17；零依赖；MIT。
+- 每文件 ≤600 行；无 C shim；三平台都要构建。
+- 测试不开真窗口、不发合成输入（`ui.Tester`、`--nanoui-snapshot`、`--nanoui-eval`）。
+- 不轮询；分配的对象要释放（`objc.Pool`）；每个 widget 行为配测试。
+- 性能改动须 hillclimb（`hillclimb/`，5 场景，±5% 为噪声）。
 
-## nanoui 仓库结构（/Users/sternelee/www/github/nanoui，分支 mcpbox 与 main 同步）
-- Zig 0.17.0（/opt/homebrew/bin/zig），v0.2.0，零依赖，MIT，AGENTS.md 硬规则：
-  每文件 ≤600 行（`zig build lines`）、无 C shim、三平台都要构建、
-  绝不开真窗口/发合成输入（用 ui.Tester、--nanoui-snapshot/--nanoui-script/--nanoui-eval）、
-  不轮询、alloc 对象要释放（objc.Pool）、每 widget 行为配测试、
-  改动后 `zig build -Dtarget=aarch64-linux-gnu --prefix zig-out/linux` 和 `-Dtarget=x86_64-windows-gnu`，
-  Linux 测试在容器（tools/linux.Dockerfile）跑。
-- apps/ 下现有两个独立仓库 submodule：nanoterm（约13.5k行）、nanomon（约5.5k行），
-  各自 build.zig.zon pin nanoui git 依赖；`zig build run --fork=../..`（Zig 0.17 内建旗标）
-  用旁边的 nanoui 源码覆盖依赖树构建。
-- 性能改动须 hillclimb（hillclimb/，5 场景，±5% 为噪声）。
+## nanoui 接口参考
 
-## nanoui 关键 API（供重写用）
-- 入口模式（apps/nanoterm/src/main.zig）：`nanoui.App.create(init, .{.name=...})` →
-  `app.newWindow(.{.title,.width,.height,.min_width,.min_height,.content=.{.view=.{.ptr=&state,.build=fn} or .init(&state, viewFn)}, .on_close=.{.ctx,.func}})` → `app.run()`。
-  `ui.View.init(&state, State.view)`，view 签名 `fn view(s:*State, c:*ui.Context) void`，立即模式每帧跑。
-- 线程 → 主线程：`objc.dispatchMain(ctx, workFn)`（async 到主队列）、`objc.dispatchAfter(ns,...)`、
-  `App.after(ms, ctx, fn)`；nanoterm 的做法：后台算完 `w.redraw()`（Window.redraw() 触发重画）。
-- `nanoui.fdwatch.readable(fd, ctx, handler)` / `.exited(pid,...)`：libdispatch 源，主
-  线程回调，不轮询 —— stdio 子进程读输出用这个（nanoterm proc.zig 有完整范例）。
-- 目录：`nanoui.path(gpa, .{.data|.cache|.home|...}, app_name)`（macOS ~/Library/...，
-  data/cache 自动创建）—— Go 版 mygo.PathUserData 的对应物；存 servers.json、
-  gateway-tokens.json、credentials/ 目录。
-- 网络：std.http.Client（Zig 0.17，70KB，线程安全连接池，TLS 默认开）；
-  服务端 std.http.Server（30KB，per-connection：Server.init(reader,writer) → receiveHead() → Request），
-  自己写 accept 循环 + std.net.Server。update.zig 里 nanoui 自己用 /usr/bin/curl 而非
-  std.http —— 但 registry/OAuth 需要 POST+header，用 std.http.Client。
-- Tray：`app.newTray(.{...})`，`tray.setSymbol/setMenu/setTitle`；菜单 `app.setMenu(template)`、
-  `app.after(ms,...)`；window: show/hide/focus/redraw/setTitle/isVisible。
-- UI 原语（src/ui/ui.zig）：column/row/end/card/scroll/divider/text/textf/button/checkbox/
-  toggle/slider/segmented/textField/div(c).row().gap(8) 链式/list(虚拟化)/icon/label/badge/
-  spacer/pressable/image；`ui.keys.label("⌘P")`；Shortcut/`c.OnShortcut`；Theme（theme.zig）。
-  ui.Tester：`t.init(gpa, .init(&state, view), .{})`、clickText/hasText/screenshot/runScript。
-- Liquid Glass `.glass(.{})`（macOS 26 材质），侧边栏玻璃可选；主题跟随系统 isDark()。
+- 入口：`nanoui.App.create(init, .{.name=...})` →
+  `app.newWindow(.{.title,.width,.height,.min_width,.min_height,.content=.{.view=.init(&state, viewFn)}, .should_close=.{.ctx,.func}})` → `app.run()`。
+  view 签名 `fn view(s:*State, c:*ui.Context) void`，立即模式每帧跑。
+- 线程 → 主线程：`objc.dispatchMain(ctx, workFn)`、`objc.dispatchAfter(ns,...)`、
+  `App.after(ms, ctx, fn)`；后台算完调用 `w.redraw()` 触发重画。
+- 文件描述符：`nanoui.fdwatch.readable(fd, ctx, handler)` / `.exited(pid,...)`，
+  主线程回调、不轮询。
+- 目录：`nanoui.path(gpa, .{.data|.cache|.home|...}, app_name)` 给出用户数据目录，
+  data/cache 自动创建；`servers.json`、`gateway-tokens.json`、`credentials/` 都在这里。
+- 网络：`std.http.Client`（Zig 0.17，线程安全连接池，TLS 默认开）用于 registry 与 OAuth；
+  服务端用 `std.http.Server` 加自己的 accept 循环。
+- Tray：`app.newTray(.{...})`、`tray.setSymbol/setMenu/setTitle`；`app.setMenu(template)`。
+  window：show/hide/focus/redraw/setTitle/isVisible。
+- UI 原语：column/row/card/scroll/divider/text/textf/button/checkbox/toggle/slider/
+  segmented/textField/div 链式/list(虚拟化)/icon/label/badge/spacer/pressable/image；
+  `ui.keys.label("⌘P")`；`Shortcut`/`c.OnShortcut`；Theme 在 `theme.zig`。
+- `ui.Tester`：`t.init(gpa, .init(&state, view), .{})`、clickText/hasText/screenshot/runScript。
+- Liquid Glass `.glass(.{})`；主题跟随系统 `nanoui.isDark()`。
 
-## mcp-go（/Users/sternelee/www/gitee/mcp-go）源码分析
-Go 1.27，mygo v0.5.1 框架 + mark3labs/mcp-go v1.3.0（client/transport/mcp/server 包）。
-27 个 .go 文件，10,808 行（含 1,742 行 main_test.go）。mygo.json: name mcp-go,
-identifier dev.mcpgo.gateway, out build。resources/icon.png。
-版本 const version = "0.1.0"。
+## 配置
 
-### main.go（99 行）
-config.Load（失败→Default）→ NewCredentialStore → gateway.New(cfg,creds,version) → newApp。
-mygo.App.WhenReady: NewWindow(1080x740, min 820x560, StateKey "main", VibrancySidebar,
-Content ui.View(a.view))；OnBeforeQuit 设 quitting + gw.Stop；关窗 e.PreventDefault()→Hide()
-（菜单栏/Dock icon 再唤起）；runMenubar → a.onReload=mb.refresh, a.openMain=mb.open；
-gw.SetOnChange(a.onChange)；go a.boot()。boot: busy="Starting the gateway…", gw.Start(ctx, cfg.Port),
-完成后 busy="" + reload + 失败 toast。
+### 基本类型
 
-### app.go（626 行）— UI 状态与外壳
-- serverForm{editing,isNew,id,name,transport(int),command,args,env,url,headers,oauth,enabled,
-  tokenHeader,tokenScheme,token,hasToken,clientID,clientSecret,err}
-- transportOptions = ["stdio","SSE","HTTP"]
-- pageDef{path,title,icon}; pages: /servers,/market,/routes,/tools,/settings（Cmd+1..5）
-- inboundModes = [InboundOff, InboundToken, InboundOAuth]
-- app struct: cfg,creds,gw,win,router(新窗口"/servers",Animation=ui.Snappy),panel(flyout),
-  onReload,openMain,serversList/toolsList ui.ListState, status map[string]gateway.ServerView,
-  tools []gateway.ToolView, events, flags map[string]*bool（稳定 bool 指针，enabled 开关）,
-  sel,toolSel,panelTab,port(f64),busy,pending(toast),filter,serverView(0列表/1卡片),
-  sidebarCollapsed,toolFilter,form,imp(importForm{open,text,err}),confirm,removeID,
-  serversGrid,reg(registry.Client，测试可 stub),market,openExternal(测试可观察),
-  auth(gateway.AuthState),authToken,authMode,callArgs,callResult,callErr,calling。
-- reload(): 从 gw 拷 status/tools/events/auth/authToken/authMode + clampToolSelection，主
-  线程跑；onChange→post(a.reload)；post: win!=nil 才 win.Update(fn)（测试无窗口时跳过）；
-  toast: pending → 下帧 c.Toast()；sync(): busy="Connecting servers…", go gw.Sync → 回主线程。
-- view(): toast→pageShortcuts(Cmd+数字)→vibrant时 Root 透明→Row{sidebar, content(Grow1,
-  minWidth0, vibrant时加背景)}→router.View 分派五页→serverForm/importDialog/removeDialog。
-- sidebar(216px/rail 64px, Animate 180ms)：head(折叠按钮+品牌 zap 图标+"MCP Gateway"+
-  v0.1.0)、ui.Sidebar+SidebarItem(tooltip 含 ⌘N)、Divider、底部 livePill(serving/stopped)+
-  summary()("N of M servers ready"/"No servers configured")；折叠状态存 cfg.SidebarCollapsed。
-- 公共件：pageHeader(title,subtitle,actions)、emptyState、statusColor(Ready=Success,
-  Connecting=Warning, NeedsAuth=Accent, Error=Danger, else TextMuted)、statusLabel
-  (ready/connecting/sign in/error/off)、splitLines、parsePairs("Key: value"→map)、
-  formatPairs(排序写回)。
-- summary(): ready 数 / len(cfg.Servers)。
+- `Transport`: `stdio | sse | http`，label 分别为 `"stdio"`、`"SSE"`、`"HTTP"`。
+- `InboundMode`: `off | token | oauth`；`RequiresToken()` = `token || oauth`；
+  label `"Off"`、`"Token"`、`"Token + OAuth"`。
+- 默认端口 `7331`。
 
-### internal/config（338+309+314+tests 行）
-- Transport enum: stdio|sse|http, Label()→"stdio"/"SSE"/"HTTP"。
-- InboundMode: off|token|oauth; RequiresToken() = token||oauth; Label()→"Token"/"Token + Off"→"Token + OAuth"/"Off"。
-- DefaultPort = 7331。
-- ServerConfig{ID(stable,16hex NewID=8字节hex),Name,Alias,Transport,Enabled,
-  Command,Args,Env([]"K=V"),URL,Headers(map,非密),OAuth,TokenHeader,TokenScheme}。
-  Validate(): name必填; stdio→command必填且不能OAuth/TokenHeader; http/sse→URL必填且
-  http(s)://开头; OAuth和TokenHeader互斥; TokenHeader须合法header名[a-zA-Z0-9_-]。
-- Config{Port,Servers,Inbound,SidebarCollapsed}; Default={Port:7331,Inbound:off};
-  Server(id),Upsert,Remove; EnsureAliases(): alias空则用Name→aliasFor(小写,字母数字保留,
-  -_空格.→_,trim _,空则"server")，冲突则 _2,_3…（返回是否改动）。
-- Path(): mygo.PathUserData + "/servers.json"; Load()（无文件→Default，port0→7331，
-  EnsureAliases）; Save(): MarshalIndent 2空格+换尾换行, tmp 0600 原子 rename。
-- CredentialStore: backend 接口 get/set/delete。NewCredentialStore=mygo.Secrets（keychain）
-  回退文件（dir = userData/credentials, key 带子目录: "oauth-token/<id>.json" 等, 0600,
-  dir 0700, MaxSecretSize 内优先 keychain）；NewMemoryCredentialStore=测试用内存 map。
-  Keys: "oauth-token/"+id, "oauth-client/"+id, "upstream-token/"+id, "inbound-token"。
-  API: UpstreamToken/HasUpstreamToken/SetUpstreamToken, InboundToken/SetInboundToken,
-  Client(id)→ClientCredentials{ClientID,Secret,Issuer,AuthMethod}, SaveClient,
-  SignedIn(id)（读 token JSON: AccessToken非空且未过期）, SignOut, TokenStore(id)
-  （适配 mcp-go transport.TokenStore: GetToken/SaveToken）。
-- import.go: ParseMCPConfig — 容器键 ["mcpServers","servers","mcp"]，或单服务器对象
-  (serverKeys: command,url,type,transport,args,env,headers,oauth)，或裸 name→server map。
-  空→"there is not..."错误、非{→"the configuration should be a JSON object"、
-  空map→"no servers were found in that configuration"。parseServer: name取键或raw.Name，
-  Enabled默认true（可被raw.enabled覆盖），transport推断(type/transport→stdio/command/
-  sse/event-stream/http/streamable-http/...；空type+command→stdio，空+url→http)，
-  无名→defaultName(command的base / URL host / "Imported server")，Validate失败即错
-  (错误带 "name: " 前缀)。stringList 接受单字符串或数组。keyValues env 排序 "K=V"。
-  Config.Import(servers): 按 name 大小写不敏感匹配→保留 ID+Alias 计 Updated，否则
-  NewID 计 Added，Upsert 后 EnsureAliases。ImportResult.Summary(): "Nothing was imported" /
-  "Imported N server(s)" / "Updated N server(s)" / "Imported X and updated Y"。
+### ServerConfig
 
-### internal/gateway
-- 常量: separator="__"; metaToolName="gateway__list_servers"; maxEvents=500;
-  Status: disabled|connecting|ready|needs-auth|error。
-- route{serverID,upstream,def}; ToolView{Name(带前缀),Upstream,ServerID,ServerName,
-  Description,Schema(缩进JSON)}; ServerView{Config,Status,Err,Tools,SignedIn};
-  Event{Time,ServerID,Text,Err}。
-- Gateway 字段: cfg,creds,srv(下游 server.MCPServer),syncMu(串行 Sync/Reconnect/Stop),
-  mu,upstreams,routes,status,errs,signedIn(缓存 keychain 读),authToken(缓存),
-  tokens(*issuedTokens),events,pending(map pendingAuth),sessions,stream(StreamableHTTPServer),
-  sse(SSEServer),http,port,onChange,version。
-- New(): srv=mcp.NewMCPServer("mcp-gateway",version, WithInstructions("A gateway that
-  aggregates...Tool names are prefixed..."), WithToolCapabilities(true)(发 tools/list_changed),
-  WithRecovery(), WithHooks)；registerMetaTool()；trackSessions()。
-- meta 工具 handler: 返回 {servers:[{name,transport,status,tools,error?}],tools:N} 缩进JSON。
-- RefreshCredentials(): 对每个 非stdio且无TokenHeader 的 server 读 creds.SignedIn→signedIn map；
-  inbound RequiresToken 时读 InboundToken→authToken（空 token 或不需要时才更新 authToken）。
-  在后台线程调（读 keychain 慢）。
-- Sync(): syncMu；RefreshCredentials；stale(配置里没了/禁用)→摘除+unregister+异步 Close+note
-  "disconnected X"；enabled 未连→status=connecting+todo；逐个 connectOne（错误收集
-  errors.Join）；禁用→status=disabled+删err。connectOne: connect() 失败时 NeedsAuthError
-  →status=needs-auth+note "X: sign in required"；其他→status=error+note err；成功→存upstream,
-  status=ready, registerLocked, note "X: N tools"。changed() 每次变更回调 onChange。
-- registerLocked: 每工具 name=alias+"__"+t.Name，Description 空→"From X." 否则
-  "[X] desc"，handler 调 owner.CallTool 失败→NewToolResultError("X: err")（工具错误不
-  是协议错误），存 routes。unregisterLocked 按 serverID 删+DeleteTools。
-- Start(port): port 1..65535; 已服务→错；base="http://127.0.0.1:port"；StreamableHTTP
-  挂 /mcp，SSE 挂 /sse + /message(StaticBasePath"/",BaseURL=base)，/healthz；全部
-  guard(resourcePath) 包裹。常驻端点: /oauth/callback（上游回调）、
-  WellKnownProtectedResourcePath + resourcePaths=["mcp","sse"] 的
-  /.well-known/oauth-protected-resource[/{path}]、oauth 模式才开:
-  /.well-known/oauth-authorization-server、/oauth/register、/oauth/authorize、/oauth/token。
-  net.Listen("127.0.0.1:port")（仅本机）；ReadHeaderTimeout 15s；goroutine Serve，
-  Err以外错误→note "serving stopped: ..."；note "serving on <base>"；Sync 忽略错误。
-- Stop(): syncMu；关 http，清 upstream/status/errs/routes，pending 重置，逐个 up.Close()，
-  Shutdown 5s 超时；note "gateway stopped"。Serving()/Port()/BaseURL()（未服务用cfg.Port）/
-  redirectURI()=BaseURL+"/oauth/callback" / Endpoints()=[/mcp,/sse,/message,/healthz]。
-- handleHealth: GET → {"status":"ok","tools":N}。
-- CallTool(name,args): 查 routes→upstream.CallTool；未知→`unknown tool "x"`；
-  未连→`server of tool "x" is not connected`。
-- Tools(): 排序 by name；schemaJSON: RawInputSchema 有效则 indent，否则 InputSchema indent。
-- Upstream{Config,client,tools}: Tools()、CallTool(tools/call)、Close()。
-- connect(): LogBuffer(50) 收 stderr → newClient → Start → Initialize(protocolVersion=
-  LATEST, clientInfo {Name:"mcp-gateway",Version}) → ListTools；每步失败 needsAuth 检查
-  （非stdio且无TokenHeader 且 OAuth/authorization required 错误）→NeedsAuthError，
-  否则 withLogs(err, stderr)（err+"\n"+stderr文本）。
-- newClient: stdio→NewStdioMCPClientWithOptions(cmd,env,args, WithCommandStderrWriter(logs));
-  sse→oauthFor ? NewOAuthSSEClient(url,oauthConfig) : NewSSEMCPClient(url, WithHeaders);
-  http→oauthFor ? NewOAuthStreamableHttpClient : NewStreamableHttpClient(WithHTTPHeaders)。
-- oauthFor: 非stdio 且 (forceOAuth || sc.OAuth || (无TokenHeader && creds.SignedIn))。
-- requestHeaders: sc.Headers + TokenHeader 时 creds.UpstreamToken 经 tokenValue(scheme,token)
-  （scheme trim 空则裸token，否则 "scheme token"），token 覆盖同名手写 header。
-- oauthConfig: creds.Client(id) 的 ClientID/Secret/Issuer/AuthMethod + RedirectURI=
-  opts.redirectURI + TokenStore=creds.TokenStore(id) + PKCEEnabled + 30s HTTP client。
-- LogBuffer(50行,单行512截断加"…"): Write 按\n切行，无\n超512也切；Lines/String。
-- sessions.go: SessionView{ID,Client,Version,Protocol,Connected,LastActive,Calls}；
-  hooks: OnRegisterSession→记 sessions[id]{Connected:now}；OnUnregister→删+note
-  "agent disconnected: <name|id>"；AfterInitialize/AfterDiscover→introduce(clientInfo,
-  protocol)（首命名→note "agent connected: X"）；BeforeCallTool→Calls++/LastActive。
-  Sessions() 按 Connected 升序。
+字段：`id`（稳定，16 个十六进制字符；新 id 为 8 字节随机数）、`name`、`alias`、
+`transport`、`enabled`（默认 `false`）、stdio 的 `command`/`args`/`env`（`"K=V"`）、
+SSE/HTTP 的 `url`/`headers`（非密）/`oauth`，以及静态凭据的 `tokenHeader`/`tokenScheme`
+（token 本身存凭据库，不写进配置文件）。
 
-### internal/gateway/auth.go（自建 OAuth 授权服务器 + 入站 guard）
-- authScope="mcp"; authCodeTTL=5min; resourcePaths=["mcp","sse"]。
-- guard(resourcePath,next): mode 不需token→放行；bearerToken(r)（Authorization: Bearer x，
-  case-insensitive scheme）== want(constant-time) 或 g.tokens.accepts(presented)→放行；
-  否则 401 + WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource/<path>"
-  + {"error":"invalid_token","error_description":"this gateway requires a bearer token"}。
-- serveAsAuthServer: 非 oauth 模式→404。
-- inbound(): 缓存的 (cfg.InboundMode(), authToken)。
-- AuthState{Mode,HasToken,IssuedTokens,MetadataURL,AuthorizationServer}。
-- GenerateAuthToken()=randomToken；SetInbound(mode,token): mode 无效错；RequiresToken 时
-  token 和已知都空→`<mode.Label()> mode needs a token`；token非空→creds.SetInboundToken+缓存；
-  cfg.Inbound=mode；切模式保留旧 token。RevokeIssuedTokens→tokens.revokeAll+note。
-- handleProtectedResource: RFC9728 {resource: resourceURL(path), resource_name:"MCP Gateway",
-  bearer_methods_supported:["header"], scopes_supported:["mcp"], oauth模式加
-  authorization_servers:[base]}。
-- handleAuthServerMetadata: RFC8414 {issuer, authorization_endpoint, token_endpoint,
-  registration_endpoint, response_types_supported:["code"], grant_types_supported:
-  ["authorization_code","refresh_token"], code_challenge_methods_supported:["S256"],
-  token_endpoint_auth_methods_supported:["none"], scopes_supported:["mcp"]}。
-- handleRegister: POST only, body≤64KB, client_name+redirect_uris；无redirect→
-  invalid_redirect_uri "at least one redirect_uri is required"；非法URI（非http/https或无host）→
-  invalid_redirect_uri `<q> is not an http or https URL`；成功→201 {client_id,client_name,
-  redirect_uris,token_endpoint_auth_method:"none",grant_types,response_types}；note
-  "registered OAuth client <name|(unnamed)>"。
-- handleAuthorize: GET/POST；redirect_uri 必须在 client 注册列表（否则 400 HTML
-  authorizeError）；response_type!=code→重定向 error unsupported_response_type；无
-  challenge 或 method!=S256→invalid_request "PKCE with code_challenge_method=S256 is
-  required"；GET→consentPage（HTML 表单隐藏字段回 POST /oauth/authorize，"Allow this
-  client to use MCP Gateway?"）；POST→newCode→302 重定向 redirect_uri?code&state。
-- handleToken: POST；authorization_code→exchangeCode（takeCode 先取后验防暴力：
-  clientID/redirect_uri/PKCE(SHA256 base64url raw 常量时间) → issue(access,refresh)，
-  200 {access_token,token_type:"Bearer",expires_in,scope:"mcp",refresh_token}）；
-  refresh_token→renew→tokenResponse；其他→unsupported_grant_type
-  "only authorization_code and refresh_token are supported"。
-  响应 Cache-Control: no-store。
+校验：
 
-### internal/gateway/tokens.go（自建 AS 的令牌持久化）
-- AccessTokenTTL=12h; RefreshTokenTTL=30天。文件 userData/gateway-tokens.json：
-  {access:{<sha256hex>:{client_id,scope,expires_at}}, refresh:{...}, clients:{id:{redirect_uris,registered_at}}}
-  （键是 token 的 sha256hex，文件本身不泄权）。tmp 0600 原子 rename。
-- issuedTokens{mu,path,access,refresh,clients,codes}: load（坏文件忽略）、saveLocked、
-  pruneLocked（过期删）、issue(clientID,scope)→(access,refresh,expiresAt) randomToken 32字节
-  base64url raw、renew(refresh,clientID)（校验归属）、accepts(token)（过期顺手删）、
-  count、revokeAll、registerClient(redirect_uris)→client_id、clientRedirects、
-  newCode(clientID,redirectURI,challenge,scope)（TTL5min）、takeCode（一次性）、
-  randomToken()=base64.RawURLEncoding(32B)。
+- `name` 必填（去空白后非空）。
+- stdio：`command` 必填；不能开 OAuth 或设置 token header。
+- SSE/HTTP：`url` 必填且以 `http://` 或 `https://` 开头；OAuth 与 token header 互斥；
+  token header 必须是合法 header 名 `[a-zA-Z0-9_-]`。
 
-### internal/gateway/oauth.go（上游 OAuth 流）
-- pendingAuth{TTL 5min}; beginAuthTimeout=60s。BeginAuth(ctx,serverID): 查配置，构造
-  transport.OAuthHandler（带 clientName "MCP Gateway", redirectURI, PKCE, TokenStore,
-  creds.Client 已存凭据）→打开浏览器授权URL→pending[serverID]；handleOAuthCallback:
-  换 token 存 TokenStore+saveClient+markSignedIn+note "signed in to X"+writeCallbackPage
-  （成功/失败 HTML 页，textColor/mutedColor）。SignOut: 删 token+markSignedIn(false)。
-  SetClientCredentials/ClientCredentials 存读 creds。
+失败消息：`"name is required"`、`"unknown transport <q>"`、
+`"command is required for stdio servers"`、`"signing in is only for SSE and HTTP servers"`、
+`"URL is required for <label> servers"`、`"URL must start with http:// or https://"`、
+`"the token and signing in cannot both be used"`、`"<q> is not a valid header name"`。
 
-### internal/registry（305+tests）
-- Client.Search(ctx,query,cursor,limit)→Page{...}：查官方 MCP registry；
-  Server.ShortName()；Server.Install()/Package.Install()→Install{...}；
-  EnvLines(vars) 渲染 "KEY=value" 行。Market 页用。
+### Config
 
-### UI 页（main 包）
-- page_servers.go（871 行，35 函数）: serversPage、serversGridView(卡片/列表)、
-  toolbarRow(搜索+视图切换+Add)、serversSummary、visibleServers(过滤)、serverMatches、
-  clampSelection、selectedIndex、revealServer、serverRow、serverCard、serverMenu(右键/
-  溢出菜单: edit/reconnect/sign in/out/forget token/remove)、serverSwitch(enabled开关)、
-  serverDetail(状态描述)、signInOffered、addServer、tokenPlaceholder/tokenHint、
-  forgetToken、editServer、serverForm(模态: name/transport segmented/stdio: command+args+env
-  textarea / http+sse: url+headers textarea+oauth toggle+token header+scheme+token密码框 /
-  clientID/clientSecret when oauth / enabled)、saveForm(校验+保存+sync)、askRemove、
-  removeDialog(确认)、removeServer、importDialog(粘贴JSON)。
-- page_market.go（275, 8函数）: marketPage(搜索框+结果列表)、marketRow、marketKind、
-  marketSummary、marketSearch(more 分页, debounce marketSearchSoon)、installed、addFromMarket
-  （Install→Config）。
-- page_routes.go（96, 3函数）: routesPage（Sessions 列表 routeRow: client/version/protocol/
-  connected时间/calls/lastActive relativeTime）。
-- page_tools.go（271, 9函数）: toolsPage（过滤+表格 toolTable+详情 toolDetail(schema JSON+
-  callTool: callArgs JSON textarea→gw.CallTool→callResult/callErr/calling）、transportWord、
-  orPlaceholder、formatToolResult。
-- page_settings.go（339, 14函数）: settingsPage 四卡：callersCard(入站 auth 模式
-  segmented+token 显示/复制/rotate+revoke issued+解释 authExplanation)、serveCard(port 输入
-  +start/stop+setPort/restart)、endpointsCard(endpoints 列表+clientConfig JSON+serverLine)、
-  activityCard(events 时间线)。
-- menubar.go（297, 11函数）: runMenubar(菜单栏 tray/panel 窗口)、toggle/open(page)/refresh、
-  plural、panelView(panelTab: servers/routes)、panelServers、panelRoutes、panelServerRow、
-  panelAgentRow、trayIcon(template PNG bytes)。
-- ui_kit.go（113, 5函数）: SVG 图标常量（iconServers/Store/Routes/Tools/Sliders/Zap/
-  ChevronsLeft/Right 等 lucide 风格 24 viewBox stroke 线稿）、statusPill、livePill、
-  liveDot、surfaceShadow、card。
-- mygo 测试模式（main_test.go 1,742 行，76 个 Test）: 无窗口 newApp + ui 渲染快照断言，
-  openExternal/registry 可注入 stub。
+字段：`port`、`servers`、`inbound`、`sidebarCollapsed`；默认 `{port: 7331, inbound: off}`；
+`Server(id)`、`Upsert`、`Remove`。
 
-## 关键移植决策
-- mygo.Secrets(keychain) → macOS 用文件回退为主即可（或 Security framework 后续加）；
-  首版 CredentialStore 用 userData/credentials/ 文件 0600（保持接口一致）。
-- go 的 goroutine+Update(main) → std.Thread.spawn + objc.dispatchMain → win.redraw()。
-- mcp-go 库的三 transport/下游 server → 自研: JSON-RPC 2.0 over stdio(child+fdwatch)、
-  Streamable HTTP(std.http.Client + SSE 解析)、下游 std.http.Server accept 循环。
-- OAuth 上游(动态注册+PKCE+刷新) 自研实现。
+`EnsureAliases()`：alias 为空时由 name 生成——转小写，保留字母数字，`-_空格.` 转 `_`，
+去掉尾部 `_`，结果为空则用 `"server"`；冲突时追加 `_2`、`_3`…，返回是否改动。
 
-## 源码精读补充（第二批：oauth/registry/page_servers/page_market/page_routes）
-- oauth.go：pendingAuth{serverID,verifier,handler,created} TTL=5min；BeginAuth 前置校验
-  （stdio/有TokenHeader→"does not sign in with OAuth"；未 Serving→"start the gateway first..."）；
-  connect 成功(已登录)→空URL；NeedsAuth→GetOAuthHandler，无 clientID→RegisterClient
-  (clientName="MCP Gateway")否则提示手动填 client ID/secret；GenerateState/CodeVerifier/
-  GetAuthorizationURL→pending[state]→note "waiting for sign-in in the browser"→saveClient。
-  handleOAuthCallback：error/state/code/过期各错误页文案（"This sign-in has expired, or was
-  already completed..."），ProcessAuthorizationResponse→note+markSignedIn+成功页
-  "You can close this tab and return to MCP Gateway."→goroutine Reconnect。
-  SignOut：creds.SignOut+markSignedIn(false)+Reconnect。writeCallbackPage(textColor
-  ok=#111 else #b00020, muted=#555)。
-- registry.go：DefaultBaseURL="https://registry.modelcontextprotocol.io"；Client{BaseURL,HTTP}
-  可stub；Server{Name,Description,Version,Homepage,Remotes[{Type,URL}],Packages[{RegistryType,
-  Identifier,Version,RuntimeHint,Arguments,Env}],UpdatedAt}+ShortName()；GET /v0/servers?
-  search=&cursor=&limit=，Accept json，20s 超时，非200→"the registry answered <status>"；
-  只取 _meta...official.isLatest=true 条目；Package.Arguments=runtimeArgs+Identifier+
-  packageArgs；Install()：优先 streamable-http remote→sse remote→package.Install()
-  （npm→RuntimeHint||npx，pypi→RuntimeHint||uvx，oci→docker run -i --rm，否则 false）；
-  EnvLines: 有Default→K=V，Required→K=。
-- page_servers.go（871行35函数）：serversPage；pageHeader actions(Spinner busy, Edit…,
-  Reconnect, Remove, Paste JSON…, PrimaryButton Add server…)；emptyState "No servers yet"；
-  toolbarRow(SearchField 280宽+serversSummary+Segmented List/Grid)；serversSummary 由
-  ready/needs-auth/error/disabled 计数以 " · " 连接；visibleServers 过滤 Name/Alias/
-  Transport.Label/Command/URL 小写包含；selectedIndex 返回配置索引或-1；serverRow(56高,
-  ContextMenu, 单击选中双击编辑, Avatar+name+serverDetail, statusPill, transport badge,
-  "%d tools" 右对齐54, signInOffered→Connect/Disconnect 按钮, serverSwitch)；
-  serverDetail：Err 优先，stdio→command+args 否则 URL，前缀 "Off · "/"Connecting · "+
-  "Sign in required · "；signInOffered=非stdio无TokenHeader&&(OAuth||SignedIn||needs-auth)；
-  addServer 默认 enabled/tokenHeader=Authorization/tokenScheme=Bearer；
-  serverForm(Modal)：Name/Transport Segmented，stdio→Command+Arguments(每行一个)+Environment
-  (KEY=VALUE) textarea；否则 URL+oauth Switch("The gateway opens your browser and stores the
-  token in the system keychain.")→Client ID/secret+非新时 "Sign in now"；非oauth→Token header/
-  Scheme/Token(密码)+hasToken→Forget+Other headers textarea；Enabled switch；err 红字；
-  Cancel/Save。saveForm：validate→Upsert→EnsureAliases→Save，OAuth→SetClientCredentials
-  否则token非空→SetUpstreamToken，revealServer+toast "X saved"+sync。removeDialog 文案
-  "Remove “X”?"/"Its tools are withdrawn...forgotten."；removeServer→SignOut+SetUpstreamToken("")
-  +toast "X removed"。signIn：openAuthURL+toast "Already signed in"|"Finish signing in in your
-  browser"。importPlaceholder=JSON 示例；importServers→ParseMCPConfig→Import→Save→toast Summary。
-- page_market.go：marketPageSize=30；marketState{query,results,cursor,loading,searched,err,
-  seq(debounce),sel,list}；首访空 query 自动搜；Changed→400ms debounce(seq 比对)；marketRow
-  (Avatar+ShortName+Description+badge marketKind(remote|命令名|manual)+"v"+version，installed→
-  badge "Added" | 不可装→"Manual" | PrimaryButton "Add X")；marketSummary("N shown, more on the
-  registry"|"N found")；marketSearch 30s 超时，非 live 同步执行否则 goroutine+post；installed
-  =URL匹配Remotes 或 pkg.Identifier 在 sc.Args；addFromMarket：Install→Remote→url+sse|http，
-  本地→command+args+EnvLines。
-- page_routes.go：header 右 "N connected"；空→"No agents connected"+Open Settings→router.Push
-  ("/settings")；routeRow 56高：Avatar=Client||ID、version、monospace 10px ID、protocol badge、
-  calls("no calls yet"/"1 call"/"N calls")、"connected "+relativeTime 右对齐150；
-  relativeTime：<1min "just now"，<1h "Nm ago"，<24h "Nh ago"，否则 "Nd ago"。
+### 文件
 
-## 源码精读补充（第三批：page_settings/page_tools/menubar/ui_kit + 测试模式）
-- page_settings.go（14函数）：settingsPage=Column Fill Padding20 Gap14 {pageHeader+Scroll
-  {serveCard,callersCard,endpointsCard,activityCard Gap16}}。callersCard(card iconShield
-  "Callers")：Segmented(authMode, "Off","Token","Token + OAuth")→setAuthMode；Text 11
-  TextMuted=authExplanation(mode)（token→"Callers must send the token below. Nothing else
-  can reach the tools."；oauth→长文案"…sign-in server, anything running on this computer…"
-  ；off→"Anything that can reach the port may call the tools. The port is loopback only."）；
-  RequiresToken→Field("Token callers present", TextInput ReadOnly 320,
-  Description "Send it as: Authorization: Bearer <token>")+Copy(clipboard,toast "Token copied")
-  +New token→rotateAuthToken；auth.AuthorizationServer→"MCP clients can also sign in"+
-  MetadataURL 说明+Copy discovery URL(toast)+Textf "%d issued token(s) are live."+Revoke them
-  all(=0 disabled,toast "Every issued token was revoked")。
-  setAuthMode：mode 越界→0；RequiresToken且token空→GenerateAuthToken(失败 toast
-  "Could not make a token: "+err)；gw.SetInbound(mode,token)；cfg.Inbound=mode+Save
-  （失败 "Could not save: "）；reload+toast "Callers now need: "+Label。
-  rotateAuthToken：Generate→SetInbound→toast "A new token was issued; callers must use it now"。
-  serveCard：Field Port(NumberInput 1..65535 w120)+Save port(!changed disabled；校验1-65535
-  toast "Choose a port between 1 and 65535"，Save成功 toast "Port set to %d"，serving→restart)
-  +Spacer+livePill(serving)+Stop/Start(start: busy="Starting the gateway…"+go Start+toast
-  "Serving on "+BaseURL；stop: busy="Stopping the gateway…"；restart: busy="Moving the
-  gateway…"，Stop→Start(port)，全部 post 回主线程 busy=""+reload)。
-  endpointsCard：遍历 gw.Endpoints() 每行 Text monospace12+Copy(toast "Copied "+e)；
-  Divider+"Paste the streamable HTTP endpoint…"+Copy client config(toast "Client configuration
-  copied")；serverLine()：ready=0→"No server is connected yet, so clients would see only the
-  gateway's own tool."否则 fmt "Clients now see the tools of %d connected server(s)."。
-  clientConfig()={"mcpServers":{"gateway":{"url":BaseURL+"/mcp"}}} MarshalIndent 2空格。
-  activityCard：events 倒序取最近100条，行=Time.Format("15:04:05") monospace11 TextMuted +
-  Text12（Err→Danger 否则 TextMuted）Grow1；空→"Nothing yet."。
-- page_tools.go：toolCallTimeout=60s。toolsPage：visibleTools(过滤 Name/ServerName/
-  Description 小写含)+toolSel clamp；空tools→emptyState "No tools yet"/"Connect a server on
-  the Servers page…"→PrimaryButton "Go to Servers"→router.Push；过滤行 SearchField
-  (Placeholder "Filter by tool or server…",Label "Filter tools",280)+toolsSummary
-  ("N tools"|"N of M tools shown")；visible空→emptyState "No tools match"/"Nothing matches
-  %q."→"Clear the filter"；Row Grow1: 左 Column Grow3 MinWidth0 toolTable，右 Column Width380
-  toolTable: Table(列 Tool 200/Server 110/Description)，选中行次要列色=AccentText.Alpha(0.82)，
-  surfaceShadow+Grow1+Border1+Radius8。toolDetail(380宽 surfaceShadow Padding16 Gap8)：
-  名14Bold、"%s · %s at %s"(ServerName,Upstream,transportWord) 11 muted、desc12、Copy name/
-  Copy schema、Divider、"Input schema"+Scroll MinHeight80 MaxHeight220(空→"No parameters.")
-  monospace11、Divider、"Test call"+TextArea(callArgs,72,`{"path": "/tmp"}`)+Spinner
-  "Calling…"|PrimaryButton "Call tool"+Clear(callResult非空)；结果 Scroll Height130 Border
-  Radius6（Err→Danger）。
-  callTool：JSON 解析错→callErr+"Arguments are not valid JSON: "+err；calling=true，
-  goroutine 60s ctx gw.CallTool→win.Update→err 或 result.IsError/formatToolResult。
-  formatToolResult：全部 TextContent→join "\n"（IsError→"error: "+out）否则 MarshalIndent。
-  transportWord(cfg.Server(id).Transport.Label()，无→"unknown")；orPlaceholder trim空→fallback。
-- menubar.go（11函数）：panelWidth=360,panelHeight=480。runMenubar：NewTray(Icon=trayIcon
-  (darwin), IconIsTemplate=darwin, ToolTip="MCP Gateway")；menu=[Open MCP Gateway→open
-  ("/servers"), Show Routes→open("/routes"), Separator, RoleQuit]；linux→SetMenu；else
-  OnClick toggle()+OnRightClick(先关 panel→SetMenu(menu)→PopUpMenu→defer SetMenu(nil))。
-  toggle()：panel 已开→Close；否则 NewFlyout(Tray,PlacementBottom,Gap4,360x480,Focusable,
-  Shadow,Popover,Content=panelView)→OnClosed panel=nil。open(page)：关panel→post Push→showMain。
-  refresh()：title=agents>0?str(agents):""；tip="MCP Gateway · "+summary(+ · N agent(s)
-  connected)；tray.SetTitle/SetToolTip。plural(1→"")。panelView：Root transparent；
-  Column Fill FontSize13：Row(P14,16,10: Icon zap accent+Text Bold "MCP Gateway"+livePill+
-  Button Open→openMain(panelTab==1?"/routes":"/servers"))+Row(Segmented panelTab
-  "Servers","Routes")+Divider+Scroll Fill{Padding10,16,16 Gap2 panelServers|panelRoutes}。
-  panelServers：遍历 cfg.Servers 有 status→panelServerRow；无→"No servers configured"。
-  panelRoutes：Sessions()；空→"No agents connected"。panelServerRow：Row40 PaddingX8
-  Clicked→openMain("/servers")，Avatar+名字+tools 文案("no tools yet"/"1 tool"/"N tools")
-  +statusPill。panelAgentRow：Row40 Clicked→openMain("/routes")，Avatar=Client||ID+
-  Row{label+v"+Version}+“connected "+relativeTime(Connected)+"badge Protocol"。
-  trayIcon(template)：36px 手绘闪电多边形扫描线填充（{19.5,3},{4.5,21},{18,21},{16.5,33},
-  {31.5,15},{18,15}），template=纯黑 else NRGBA{128}，png.Encode。
-- ui_kit.go（5函数）：10个 lucide 风格 SVG（servers/tools/sliders/zap/shield/globe/activity/
-  store/routes/chevrons-left/right，24 viewBox stroke 线稿）用 ui.MustParseSVG+ui.Icon。
-  statusPill(c,s,onAccent)：Row Gap6 Shrink0，dot "●"9+label11，各 AnimateColor("status",
-  color, statusAnimation{180ms EaseInOut})；onAccent→全 AccentText。statusColor: Ready→
-  Success,Connecting→Warning,NeedsAuth→Accent,Error→Danger,else TextMuted（app.go）。
-  statusLabel: ready/connecting/sign in/error/off。livePill(on,onText,offText)：off→TextMuted
-  ，on→Success。liveDot 同理仅点+Tooltip。surfaceShadow(t,e)：luma(Rec601)<0.5→alpha0.4
-  否则0.05，Shadow(0,1,3,0,RGBA(0,0,0,alpha))。card(c,icon,title,body)：Column Padding18
-  Gap12 Radius12 Background Border+surfaceShadow，Row{Icon15 accent+Title15 Bold}+body。
-- main_test.go（76 Test，51KB）模式：TestMain 用 os.MkdirTemp+"mygo.App.SetPath(PathUserData,
-  dir)"隔离用户目录；newTestApp(t,servers...)：config.Default()+Servers+EnsureAliases+
-  NewMemoryCredentialStore+gateway.New(cfg,creds,"test")+newApp；无窗口，ui.NewTester
-  (a.view,1080,740)，断言 HasText/Find/Texts()，交互用 tt.Click/Type。UI 断言贯穿：
-  空态文案、开关语义(Connect/Disconnect 仅 OAuth)、过滤、表单校验、导入、令牌轮换、
-  快捷键 tooltip、颜色(像素取色 statusPill/liveDot/card hover lift/shadow)、减少动效仍换页、
-  桌面偏好(字号缩放/对比度)下的稳健性。
+- 路径：`<user data>/servers.json`。
+- 读取：文件不存在→默认配置；`port` 为 0→7331；读后 `EnsureAliases`。
+- 保存：2 空格缩进的 JSON，末尾换行；先写临时文件（0600）再原子 rename。
 
-## UI 主题决定（用户 m00278）
-- UI 风格采用 apps/nanomon 的主题：src/theme.zig 照 nanomon 的结构移植——Colors 结构
-  （sidebar/picked/on_picked/page/card/border/well/empty/separator/text/secondary/tertiary/
-  accent/stripe/selection/on_selection/marked/control/control_on/hover/user/system/fast/
-  frugal/gray/blue/green/red/orange/teal/purple/yellow），Codegraff 配色（暗色 bg
-  #16140f、amber #e8a33d；亮色 bg #faf8f3、amber #c77d20），`colors(dark)` +
-  `ui(dark: bool) nanoui.ui.Theme`（font "Geist"、mono "JetBrains Mono"、accent_text=
-  on_picked、danger=红、success=绿）。窗口 `.theme = theme.ui(nanoui.isDark())`，
-  测试 `t.init(..., .{ .theme = theme.ui(false/true) })`。布局/部件参考 nanomon 的
-  view_kit.zig / view_side.zig / view_table.zig 风格（侧栏、表格、卡片）。
+### 凭据库
 
-## Zig 实现的并发与生命周期（启动卡死修复，m00436）
-- 症状：`zig build run` 窗口出现后卡死。根因：`state.init` 在主线程 `gw.sync()`→
-  connectOne→handshake→`Session.call("initialize")`→`await` 无超时地
-  `waitUncancelable`，一个死服务器永久冻结窗口；UI 开关/reconnect 同理。
-- Session（session.zig）：`default_call_timeout` 30s（`Io.Clock.Duration`），
-  `await` 用 `cond.waitTimeout` 到 deadline，Timeout→`error.TimedOut`；
-  新增 `waiters` 计数，`deinit` 先置 closed+broadcast 再 join 所有 waiter，
-  然后才释放 pending（修掉 close() 与等待线程的 UAF）。
-- Gateway（gateway.zig + gateway_serve.zig）：`startAsync/syncAsync/reconnectAsync`
-  spawn 分离线程跑 `sync/reconnect`（`sync_mu` 串行）；`state.init` 用
-  `startAsync`，`resync` 用 `syncAsync`，UI 永不阻塞。关闭序：`setClosing()`
-  （sync/reconnect 拿到 sync_mu 后先查 `closing`，connect 循环逐个查）→
-  `wakeWaiters()`（对 upstreams 里每个 sess `markClosed`，等待中的调用立即
-  返回 error.Closed）→ 加 sync_mu。`stop()` 同样先做这两步再 lock。
-- `Gateway.deinit() bool`：prelude 后用 `sync_mu.tryLock()` 自旋 ≤2s；拿不到
-  （说明有尚未注册进 upstreams 的 in-flight connect 叫不醒）就整体泄漏交给
-  进程退出回收、返回 false，`state.deinit` 据此跳过 `gpa.destroy(gw)`。
-  deinit 内含 listener 拆除（sessions.closeAll + l.stop + l.destroy），
-  调用方不再先调 stop()。死服务器配置下退出从 30s 降到 ~2s，正常配置 ~0.5s。
-- state.zig：修掉 `gw.cfg = &cfg`/`gw.creds = &store` 指向 init 栈局部
-  （use-after-return，且 UI 改的 cfg gateway 看不到）——先建 self，
-  `Gateway.init(gpa, io, &self.cfg, &self.creds, ...)`。
-- 配置内存：App 新增 `cfg_arena`（`cfgAlloc()`），config.load 与所有 cfg 变更
-  （toggleEnabled/saveForm/import/remove/ensureAliases）统一走它，退出时
-  `cfg_arena.deinit()` 一次释放；upsert/form.save 原样存入传入 allocator 的
-  字符串，所以调用处必须传 cfgAlloc()。
+接口 `get/set/delete`。没有系统钥匙串，值都放在 `<user data>/credentials/`：
+目录 0700，文件 0600。键：
+
+- `oauth-token/<id>`
+- `oauth-client/<id>`
+- `upstream-token/<id>`
+- `inbound-token`
+
+API：上游 token 的读/判断/写；入站 token 的读/写；client 凭据
+`{client_id, secret, issuer, auth_method}` 的读/保存；`SignedIn(id)`（token 非空且未过期）；
+`SignOut`；按 server id 的 token store（`GetToken`/`SaveToken`）。测试用内存实现。
+
+### 导入
+
+接受三种形状：
+
+- 容器键：`mcpServers`、`servers` 或 `mcp`；
+- 单个服务器对象（识别 `command,url,type,transport,args,env,headers,oauth`）；
+- 裸的 name → server map。
+
+错误文案：`"there is not..."`、`"the configuration should be a JSON object"`、
+`"no servers were found in that configuration"`。
+
+单个服务器：
+
+- name 取键名或 `name` 字段；无名字时用 command 的 basename、URL 的 host，或
+  `"Imported server"`。
+- `enabled` 默认 true，可被同名字段覆盖。
+- transport 推断：`type`/`transport` 为 `stdio`、`sse`/`event-stream`、
+  `http`/`streamable-http`；没有 type 但有 command→stdio；没有 type 但有 url→http。
+- 校验失败时错误前缀 `"name: "`。
+- `args`、`env` 等列表字段接受单字符串或数组；env 输出排序后的 `"K=V"`。
+- 导入按 name 大小写不敏感匹配：已有→保留 id 与 alias，计入 updated；否则生成新 id，
+  计入 added；之后 `EnsureAliases`。
+- 摘要：`"Nothing was imported"`、`"Imported N server(s)"`、`"Updated N server(s)"`、
+  `"Imported X and updated Y"`。
+
+## 网关
+
+### 基本约定
+
+- 工具名分隔符 `"__"`；元工具名 `"gateway__list_servers"`；事件上限 500。
+- 状态：`disabled | connecting | ready | needs-auth | error`。
+- `ToolView`：带 alias 前缀的名称、上游名、server id/name、描述、缩进后的 JSON schema。
+- `ServerView`：配置、状态、错误、工具、`signedIn`。
+- `Event`：时间、serverID、文本、是否错误。
+
+### 同步
+
+同步由一把 mutex 串行化。每次同步：
+
+1. 刷新凭据（上游登录状态与入站 token）。
+2. 配置里已删除或禁用的上游：断开、注销工具，记 `"disconnected X"`；禁用项状态设为
+   `disabled` 并清掉错误。
+3. 已启用但未连接的上游：状态设为 `connecting`，逐个连接并收集错误。
+4. 每个连接：
+   - 需要登录（非 stdio、无静态 token header，且 OAuth 或服务器要求授权）→
+     `needs-auth`，记 `"X: sign in required"`；
+   - 其他失败→`error`，记下原因；
+   - 成功→保存上游、状态 `ready`、注册工具，记 `"X: N tools"`。
+5. 每次变更通知界面。
+
+### 工具注册
+
+- 名称：`alias + "__" + 工具名`。
+- 描述为空→`"From X."`，否则 `"[X] desc"`。
+- 调用失败返回工具结果错误（不是协议错误）：`"X: err"`。
+- 卸载按 server id 删除工具与路由。
+
+### 服务
+
+- 端口 1..65535；已在服务→错误。
+- 只监听 `127.0.0.1:port`；读请求头超时 15s。
+- 端点：
+  - Streamable HTTP：`/mcp`
+  - SSE：`/sse` 与 `/message`
+  - `/healthz`
+  - 上游 OAuth 回调：`/oauth/callback`
+  - `/.well-known/oauth-protected-resource[/{path}]`（resource path 为 `mcp`、`sse`）
+  - OAuth 模式另有：`/.well-known/oauth-authorization-server`、`/oauth/register`、
+    `/oauth/authorize`、`/oauth/token`
+- 失败→记 `"serving stopped: ..."`；成功→记 `"serving on <base>"`。
+- 已服务时端口来自实际监听；`BaseURL()` 在未服务时用配置端口；
+  `redirectURI()` = `BaseURL + "/oauth/callback"`；`Endpoints()` = `/mcp`、`/sse`、
+  `/message`、`/healthz`。
+
+### 停止
+
+取得同步锁，关闭 listener，清空上游/状态/错误/路由与待处理授权，逐个关闭上游，
+最多等 5 秒关闭；记 `"gateway stopped"`。
+
+### 健康检查与调用
+
+- `GET /healthz` → `{"status":"ok","tools":N}`。
+- `CallTool(name, args)`：查路由后调用上游；未知工具→`unknown tool "x"`；
+  所属服务器未连接→`server of tool "x" is not connected`。
+- `Tools()` 按名称排序；schema 优先用原始 `inputSchema`，无效则用 `inputSchema` 的缩进 JSON。
+
+### 上游
+
+连接步骤：启动 client → `initialize`（最新协议版本，clientInfo
+`{name: "mcp-gateway", version}`）→ `tools/list`。每一步失败先判断是否属于“需要登录”：
+非 stdio、无静态 token header，且配置了 OAuth 或错误要求授权；否则把 stderr 附在错误后。
+
+client 选择：
+
+- stdio：子进程，环境 = 应用环境 + 配置项；PATH 自动补齐常见安装目录（`/opt/homebrew/bin`、
+  `/usr/local/bin`、`~/.local/bin` 及系统目录），不含 `/` 的命令先在这些目录中解析。
+- SSE：OAuth 时带 OAuth 配置，否则带配置 headers。
+- HTTP：同上，使用 streamable HTTP。
+
+`oauthFor` 条件：非 stdio，且（强制 OAuth、配置开 OAuth，或无静态 token header 且已登录）。
+
+请求头：配置 headers + 静态 token。scheme 去空白后为空→裸 token，否则 `"scheme token"`；
+token 覆盖同名手写 header。
+
+OAuth 配置：已存的 client id/secret/issuer/auth method、redirect URI、PKCE、token store，
+以及 30 秒超时的 HTTP client。
+
+stderr 日志：最多 50 行，单行超过 512 字节截断并加 `"..."`；展示时按行拼接。
+
+### 会话
+
+- 记录：id、client、version、protocol、connected、last active、calls。
+- 注册会话→记录时间；注销→记 `"agent disconnected: <name|id>"`。
+- initialize 后首次拿到 client 名→记 `"agent connected: X"`。
+- 每次 `tools/call` 更新 calls 与 last active。
+- 列表按 connected 时间升序（先连接的在先）。
+
+## 入站鉴权
+
+自建 OAuth 授权服务器与入站 guard。
+
+- scope `"mcp"`；授权码 TTL 5 分钟；resource paths 为 `mcp`、`sse`。
+- guard：
+  - 模式不需要 token→放行。
+  - `Authorization: Bearer x`（scheme 大小写不敏感）等于期望 token（常量时间比较），
+    或属于已签发 token→放行。
+  - 否则 401，`WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource/<path>"`，
+    body `{"error":"invalid_token","error_description":"this gateway requires a bearer token"}`。
+- `AuthState`：模式、是否有 token、已签发数量、metadata URL、是否授权服务器。
+- 生成 token；设置模式时：模式无效→错误；需要 token 且留空且没有已知 token→
+  `<mode> mode needs a token`；非空→保存并缓存；切换模式保留旧 token。
+- 吊销全部已签发 token。
+- 受保护资源元数据（RFC 9728）：
+  `{resource: resourceURL(path), resource_name: "MCP Gateway", bearer_methods_supported: ["header"], scopes_supported: ["mcp"]}`，
+  OAuth 模式下加 `authorization_servers: [base]`。
+- 授权服务器元数据（RFC 8414）：
+  `{issuer, authorization_endpoint, token_endpoint, registration_endpoint,
+  response_types_supported: ["code"],
+  grant_types_supported: ["authorization_code", "refresh_token"],
+  code_challenge_methods_supported: ["S256"],
+  token_endpoint_auth_methods_supported: ["none"],
+  scopes_supported: ["mcp"]}`。
+- 注册：只接受 POST，body ≤64KB；需要 `client_name` 与 `redirect_uris`。
+  - 没有 redirect→`invalid_redirect_uri` `"at least one redirect_uri is required"`；
+  - 非 http/https 或没有 host→`invalid_redirect_uri` `<q> is not an http or https URL`；
+  - 成功→201 `{client_id, client_name, redirect_uris, token_endpoint_auth_method: "none", grant_types, response_types}`，
+    记 `"registered OAuth client <name|(unnamed)>"`。
+- 授权：GET/POST。
+  - `redirect_uri` 必须在 client 注册列表（否则 400 HTML 错误页）。
+  - `response_type != code`→重定向 `unsupported_response_type`。
+  - 缺 challenge 或 method 不是 S256→`invalid_request`
+    `"PKCE with code_challenge_method=S256 is required"`。
+  - GET→同意页（隐藏字段回 POST `/oauth/authorize`，文案
+    `"Allow this client to use MCP Gateway?"`）。
+  - POST→生成 code，302 回 `redirect_uri?code&state`。
+- 换 token：POST。
+  - `authorization_code`：先取后验（一次性），校验 client id、redirect URI、
+    PKCE（SHA256 + base64url raw，常量时间）→签发 access 与 refresh，
+    返回 `{access_token, token_type: "Bearer", expires_in, scope: "mcp", refresh_token}`。
+  - `refresh_token`→续期。
+  - 其他→`unsupported_grant_type`
+    `"only authorization_code and refresh_token are supported"`。
+  - 响应 `Cache-Control: no-store`。
+
+## 令牌持久化
+
+- access token 12 小时，refresh token 30 天。
+- 文件 `<user data>/gateway-tokens.json`：
+  `{access: {<sha256hex>: {client_id, scope, expires_at}}, refresh: {...},
+  clients: {<id>: {redirect_uris, registered_at}}}`；键是 token 的 sha256，文件本身不泄权。
+- 先写临时文件（0600）再原子 rename；坏文件忽略；读取时清理过期项。
+- token 为 32 字节随机数的 base64url raw；授权码 TTL 5 分钟且只能使用一次。
+
+## 上游 OAuth 流程
+
+- 待处理授权 TTL 5 分钟；开始授权超时 60 秒。
+- 开始前校验：
+  - stdio 或带静态 token header→`"does not sign in with OAuth"`；
+  - 未在服务→`"start the gateway first..."`；
+  - 已连接且已登录→返回空 URL；
+  - 需要认证时，若有 client id 直接授权，否则动态注册（clientName `"MCP Gateway"`）
+    或提示手动填写 client id/secret。
+- 生成 state 与 PKCE verifier，打开授权 URL，记
+  `"waiting for sign-in in the browser"`，保存 client 凭据。
+- 回调：错误、state、code、过期各有错误页文案
+  （例如 `"This sign-in has expired, or was already completed..."`）；
+  成功→保存 token、保存 client、标记已登录、记 `"signed in to X"`，
+  成功页文案 `"You can close this tab and return to nanomcp."`，然后重连。
+- 退出登录：删除 token、标记未登录、重连。
+- 回调页配色：正常文字 `#111`，错误 `#b00020`，次要文字 `#555`。
+
+## Registry（Market）
+
+- 默认地址 `https://registry.modelcontextprotocol.io`；client 可注入
+  `{base_url, http}`，测试可替换。
+- 服务器字段：name、description、version、homepage、remotes（type/url）、
+  packages（registry type/identifier/version/runtime hint/arguments/env）、updatedAt；
+  `ShortName()` 取显示名。
+- `GET /v0/servers?search=&cursor=&limit=`，`Accept: application/json`，20 秒超时；
+  非 200→`"the registry answered <status>"`；只保留 `_meta...official.isLatest=true` 的条目。
+- 包参数 = runtimeArgs + identifier + packageArgs。
+- 安装优先：streamable-http remote → sse remote → package。
+  包安装：npm→runtime hint 或 `npx`；pypi→runtime hint 或 `uvx`；oci→`docker run -i --rm`；
+  其他不可安装。
+- `EnvLines`：有默认值→`K=V`，必填→`K=`。
+
+## 界面
+
+### Servers 页
+
+- 页头：spinner（忙时）、Edit、Reconnect、Remove、Paste JSON…、Add server…。
+- 空态：`"No servers yet"`。
+- 工具栏：搜索框宽 280 + 摘要 + List/Grid 分段。摘要按 ready/needs-auth/error/disabled
+  计数，用 `" · "` 连接。
+- 过滤：Name/Alias/Transport/Command/URL，小写包含匹配。
+- 行高 56：单击选中、双击编辑；头像、名称、详情、状态胶囊、transport 徽章、
+  工具数（右对齐 54）；OAuth 服务器可 Connect/Disconnect；启用开关。
+- 详情：错误优先；stdio 显示 command + args，否则显示 URL；前缀
+  `"Off · "`、`"Connecting · "`、`"Sign in required · "`。
+  可登录条件：非 stdio、无 token header，且（OAuth、已登录或 needs-auth）。
+- 新增默认：enabled、token header `Authorization`、scheme `Bearer`。
+- 表单：
+  - 名称、transport 分段；
+  - stdio：Command、Arguments（每行一个）、Environment（`K=V`）；
+  - 其他：URL、OAuth 开关（说明
+    `"The gateway opens your browser and stores the token in the system keychain."`）、
+    Client ID/secret、非新建时 “Sign in now”；
+  - 非 OAuth：Token header、Token scheme、Token（密码框）；已有 token 时可 “Forget the
+    saved token”；其他 headers；
+  - Enabled；错误红字；Cancel/Save。
+- 保存：校验→Upsert→EnsureAliases→保存；OAuth→保存 client 凭据，否则填了 token→保存上游 token；
+  提示 `"X saved"` 并重新同步。
+- 删除对话框：`"Remove “X”?"` /
+  `"Its tools are withdrawn...forgotten."`；删除→退出登录 + 清 token + `"X removed"`。
+- 登录：打开授权 URL；已登录提示 `"Already signed in"`，否则
+  `"Finish signing in in your browser"`。
+- 导入：JSON 示例占位；解析→导入→保存→摘要。
+
+### Market 页
+
+- 每页 30 条。状态：query、results、cursor、loading、searched、err、seq（防抖）、sel、list。
+- 首次访问空查询自动搜索；输入后 400ms 防抖（用 seq 比对）。
+- 行：头像、短名、描述、类型徽章（remote / 命令名 / manual）、版本；
+  已安装→`"Added"`，不可安装→`"Manual"`，可安装→`"Add X"`。
+- 摘要：`"N shown, more on the registry"` / `"N found"`。
+- 搜索 30 秒超时；安装后 remote→URL（sse 或 http），本地→command/args/env。
+
+### Routes 页
+
+- 页头右侧 `"N connected"`。
+- 空态：`"No agents connected"` + Open Settings。
+- 行高 56：头像（client 或 id）、版本、等宽 10px id、protocol 徽章、
+  调用数（`"no calls yet"` / `"1 call"` / `"N calls"`）、
+  `"connected " + relativeTime`（右对齐 150）。
+- `relativeTime`：<1 分钟 `"just now"`，<1 小时 `"Nm ago"`，<24 小时 `"Nh ago"`，
+  否则 `"Nd ago"`。
+
+### Tools 页
+
+- 过滤 Name/ServerName/Description。
+- 空态：`"No tools yet"` / `"Connect a server on the Servers page…"` + `"Go to Servers"`。
+- 过滤后为空：`"No tools match"` / `"Nothing matches %q."` + `"Clear the filter"`。
+- 表格列：Tool 200、Server 110、Description；选中行的次要列用强调色。
+- 详情（宽 380）：名称、`"%s · %s at %s"`（server、upstream、transport）、描述、
+  复制名称与 schema、输入 schema（空→`"No parameters."`）、
+  测试调用（JSON 文本区，占位 `{"path": "/tmp"}`）、`"Calling…"`、`"Call tool"`、
+  清除结果；结果错误显示为红色。
+
+### Settings 页
+
+四张卡：
+
+- Callers：Off/Token/Token + OAuth 分段与说明文案；需要 token 时显示只读 token、
+  `"Send it as: Authorization: Bearer <token>"`、复制、重新生成；授权服务器时显示
+  discovery URL、已签发数量、全部吊销。
+- Serve：端口 1..65535、保存、启动/停止、状态胶囊；启动时忙提示
+  `"Starting the gateway…"`。
+- Endpoints：`/mcp`、`/sse`、`/message`、`/healthz` 及复制；
+  客户端配置 `{"mcpServers":{"gateway":{"url":BaseURL + "/mcp"}}}`。
+- Activity：最近 100 条事件倒序，时间 `15:04:05` 等宽；错误红字。
+
+### 菜单栏
+
+- 托盘图标为模板闪电图；菜单 Open nanomcp、Show Routes、Quit。
+- 标题显示已连接 agent 数；提示文字带 `"MCP Gateway · "` 与服务器摘要。
+- 面板 360×480，tabs Servers/Routes；行高 40；点击行打开对应页面。
+
+### UI kit
+
+- lucide 风格线性图标：servers、tools、sliders、zap、shield、globe、activity、store、
+  routes、chevrons。
+- 状态胶囊：ready→成功色、connecting→警告色、needs-auth→强调色、error→危险色、
+  其他→次要色；开/关状态用成功/次要色。
+- 阴影按背景亮度：Rec601 luma < 0.5→alpha 0.4，否则 0.05。
+- 卡片：圆角 12、内边距 18、间距 12、边框 + 阴影，图标 + 标题 + 内容。
+
+## 测试
+
+- 全部测试在进程内运行；UI 用 `ui.Tester` 离屏驱动 1080×740 窗口。
+- 每个测试自建 gateway 与内存凭据库，不开窗口；registry 与“打开浏览器”可注入 stub。
+- 用户目录用临时目录隔离；测试不写临时目录之外，不碰剪贴板。
+- 断言覆盖：空态文案、开关语义、过滤、表单校验、导入、令牌轮换、快捷键提示、
+  颜色（状态胶囊/状态点/卡片悬停与阴影）、减少动效时仍能换页、桌面字号与对比度偏好。
+
+## 主题
+
+- Colors：sidebar、picked、on_picked、page、card、border、well、empty、separator、text、
+  secondary、tertiary、accent、stripe、selection、on_selection、marked、control、
+  control_on、hover、user、system、fast、frugal、gray、blue、green、red、orange、teal、
+  purple、yellow。
+- Codegraff 配色：暗色背景 `#16140f`、amber `#e8a33d`；亮色背景 `#faf8f3`、amber `#c77d20`。
+- 字体 Geist，等宽 JetBrains Mono；`accent_text = on_picked`；danger 红、success 绿。
+- 窗口主题跟随系统深浅色；测试可显式传 `theme.ui(false/true)`。
+
+## 并发与生命周期
+
+- 网络调用与握手不阻塞界面：`startAsync/syncAsync/reconnectAsync` 在分离线程里跑
+  `sync/reconnect`，用 `sync_mu` 串行；界面只读快照。
+- `Session` 的调用默认 30 秒超时；`await` 等到 deadline，超时→`error.TimedOut`；
+  `deinit` 先置 closed 并广播，再 join 所有等待者，最后释放待处理表。
+- 关闭顺序：`setClosing()`（sync/reconnect 拿到 `sync_mu` 后先查 `closing`，连接循环
+  逐个检查）→ `wakeWaiters()`（对每个上游 `markClosed`，等待中的调用立即
+  `error.Closed`）→ 取 `sync_mu`。
+- `Gateway.deinit() bool`：用 `tryLock` 自旋最多 2 秒；拿不到（还有未注册的 in-flight
+  连接）就整体交给进程退出回收并返回 false，`state.deinit` 据此跳过销毁。
+  deinit 内含 listener 拆除（关闭全部会话 + 停止 + 销毁）。
+- 配置内存由 `cfg_arena` 统一管理：`config.load` 与所有配置变更都从它分配，退出时一次
+  `deinit`；保存表单等把字符串原样存入传入的 allocator，因此调用处必须传 `cfgAlloc()`。

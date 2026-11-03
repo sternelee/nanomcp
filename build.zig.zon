@@ -1,7 +1,7 @@
 .{
-    .name = .mcp_go,
+    .name = .nanomcp,
     .version = "0.1.0",
-    .fingerprint = 0x2054f80228367ab4,
+    .fingerprint = 0x9ed00b6b59992f2e,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .nanoui = .{

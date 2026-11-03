@@ -9,11 +9,6 @@
   <img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
-A rewrite of [mcp-go](https://gitee.com/sternelee/mcp-go) on nanoui: same
-behaviour, same words, same tests, one window instead of a terminal. The Go
-original remains the reference; `DESIGN.zh.md` maps every Go file to the Zig
-file that replaced it, and says why.
-
 ## What it does
 
 - **One endpoint for many servers.** The gateway speaks MCP over stdio, the
@@ -54,9 +49,9 @@ zig build -Dtarget=x86_64-windows-gnu --fork=../..       # Windows
 
 ## Tests
 
-The Go original's tests are ported test for test, in the form nanoui's tests
-take: a `test "a sentence describing the behaviour"` beside the code it
-describes, and the ones that need a UI driven by `ui.Tester` offscreen.
+Tests live beside the code they describe: a
+`test "a sentence describing the behaviour"`, and the ones that need a UI
+drive it with `ui.Tester` offscreen.
 
 ```sh
 zig build test --fork=../..          # every test, the UI included
@@ -94,10 +89,9 @@ request lifecycle), `mcp_endpoint.zig`, `transport_{stdio,sse,http}.zig`
 `tokens.zig` (the authorization server and its tokens), `auth.zig`,
 `sessions.zig` (who is calling), `registry.zig` (the market), `config.zig`,
 `credentials.zig`, `import.zig`, `menubar.zig`, `page_*.zig` (the five
-pages), `view.zig`, `state.zig`. `DESIGN.zh.md` is the full specification,
-written from a reading of the Go original before this was written.
+pages), `view.zig`, `state.zig`. `DESIGN.zh.md` is the full specification.
 
 ## Licence
 
-MIT, as the Go original. The licence texts of what it links against are kept
-verbatim in the repository's `third_party/licenses/`.
+MIT. The licence texts of what it links against are kept verbatim in the
+repository's `third_party/licenses/`.

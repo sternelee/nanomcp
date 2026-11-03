@@ -262,7 +262,7 @@ pub fn handleCallback(g: *gateway_mod.Gateway, req: *server.Request) !void {
     g.mu.unlock(g.io);
 
     const pending = taken orelse {
-        return callbackPage(req, true, "Sign-in failed", "This sign-in has expired, or was already completed. Start it again from MCP Go.");
+        return callbackPage(req, true, "Sign-in failed", "This sign-in has expired, or was already completed. Start it again from nanomcp.");
     };
     defer g.pending.release(owner, pending);
 
@@ -303,7 +303,7 @@ pub fn handleCallback(g: *gateway_mod.Gateway, req: *server.Request) !void {
     g.changed();
     try req.respond(.{
         .content_type = "text/html; charset=utf-8",
-        .body = try auth.callbackPage(a, "Signed in", "You can close this tab and return to MCP Go.", false),
+        .body = try auth.callbackPage(a, "Signed in", "You can close this tab and return to nanomcp.", false),
     });
 
     // The browser has its answer; connecting the server may take a while, and

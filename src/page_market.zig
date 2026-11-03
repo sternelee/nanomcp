@@ -239,7 +239,7 @@ fn searchThread(s: *App, query: []const u8, cursor: []const u8, more: bool) void
     announcePage(s, arena, found.servers, found.next_cursor, more);
 }
 
-/// What went wrong, in the words the Go gateway uses.
+/// What went wrong, in the words the page shows.
 fn why(e: anyerror) []const u8 {
     return switch (e) {
         error.RegistryStatus => "the registry answered with an error",

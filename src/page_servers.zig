@@ -23,8 +23,8 @@ pub fn page(c: *ui.Context, s: *App, k: theme.Colors) void {
     const selected_view: ?gateway_views.ServerView = if (shown.len > 0) list[shown[s.servers.selected]] else null;
     const selected_id: ?[]const u8 = if (selected_view) |v| v.config.id else null;
 
-    // Enter opens the chosen server, as the list does in the Go original.
-    // It is left to the field while the filter has the keyboard.
+    // Enter opens the chosen server. It is left to the field while the
+    // filter has the keyboard.
     if (c.focused_text == null and c.shortcut(.{ .key = ui.Shortcut.enter })) {
         if (selected_id) |id| actions.editServer(s, id);
     }

@@ -1,5 +1,4 @@
-//! nanomcp: an MCP gateway with a GUI, rewritten from the Go original on
-//! nanoui.
+//! nanomcp: an MCP gateway with a GUI, on nanoui.
 const std = @import("std");
 const builtin = @import("builtin");
 const nanoui = @import("nanoui");

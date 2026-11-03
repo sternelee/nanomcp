@@ -139,7 +139,7 @@ pub const Registry = struct {
 
     fn lessConnected(_: void, left: View, right: View) bool {
         if (left.connected != right.connected) return left.connected;
-        // Longest-connected first, as the Go gateway lists its sessions.
+        // Longest-connected first.
         return left.connected_at < right.connected_at;
     }
 

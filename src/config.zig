@@ -1,6 +1,6 @@
 //! The gateway's persisted settings: the servers it connects to, the port it
-//! serves on, and how callers prove who they are. Ported from mcp-go's
-//! internal/config; every string lives in the arena `load` is given.
+//! serves on, and how callers prove who they are. Every string lives in the
+//! arena `load` is given.
 const std = @import("std");
 
 /// Where the gateway serves when the user has not chosen another.
@@ -179,7 +179,7 @@ pub const ServerConfig = struct {
     }
 
     /// Reports why the server cannot be connected, or null. The message is
-    /// the Go original's, allocated from `a`.
+    /// allocated from `a`.
     pub fn validateMessage(a: std.mem.Allocator, s: ServerConfig) ?[]u8 {
         s.validate() catch |err| return switch (err) {
             error.NameRequired => a.dupe(u8, "name is required") catch null,

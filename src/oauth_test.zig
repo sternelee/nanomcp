@@ -1,6 +1,5 @@
 //! The sign-in the gateway starts for an upstream that asks for one, and the
-//! client it registers itself as: driven over real loopback sockets against
-//! the Go original's oauth_test.go.
+//! client it registers itself as: driven over real loopback sockets.
 const std = @import("std");
 const json = @import("json_util.zig");
 const gateway_mod = @import("gateway.zig");

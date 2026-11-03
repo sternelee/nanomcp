@@ -69,8 +69,8 @@ fn choose(s: *App, n: usize) ?usize {
     return clamped;
 }
 
-/// Up and down move the choice, as the table does in the Go original. The
-/// filter keeps the keyboard while it is focused.
+/// Up and down move the choice. The filter keeps the keyboard while it is
+/// focused.
 fn keys(c: *ui.Context, s: *App, n: usize) void {
     if (c.focused_text != null or n == 0) return;
     const selected = s.tools.selected orelse 0;

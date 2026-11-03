@@ -3,16 +3,16 @@
 //! the token callers of the gateway must present.
 //!
 //! There is no system credential store here; every value lives in a file under
-//! `<user data>/credentials/`, written 0600 in a directory created 0700. That
-//! keeps the interface the Go original's CredentialStore had, so the gateway
-//! above it does not care where the bytes are.
+//! `<user data>/credentials/`, written 0600 in a directory created 0700. The
+//! gateway above it only knows this interface, so where the bytes are kept is
+//! a detail of this module.
 const std = @import("std");
 
 /// Parsed strings are copied, not borrowed from the buffer they came in:
 /// the buffer is freed before the value is used.
 const parse_options: std.json.ParseOptions = .{ .ignore_unknown_fields = true, .allocate = .alloc_always };
 
-/// The token an OAuth upstream issued, as mcp-go's transport.Token carries it.
+/// The token an OAuth upstream issued.
 pub const Token = struct {
     /// Trusted local provenance, not token endpoint metadata.
     issuer: ?[]const u8 = null,

@@ -203,8 +203,8 @@ pub const Registered = struct {
     challenge: []const u8,
 };
 
-/// The upstream of the Go original's oauth_test.go: a protected MCP server that
-/// answers 401 without its token, and the authorization server it points at.
+/// A test upstream: a protected MCP server that answers 401 without its token,
+/// and the authorization server it points at.
 pub const FakeUpstream = struct {
     /// Everything this server touches is its own: its handler runs on a
     /// thread of the server's, so it allocates from an arena of its own.

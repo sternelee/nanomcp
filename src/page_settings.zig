@@ -187,7 +187,7 @@ fn callers(c: *ui.Context, s: *App, k: theme.Colors) void {
     }
 }
 
-/// The exact words of the chosen mode, as the Go gateway puts them.
+/// The exact words of the chosen mode.
 fn explanation(mode: config.InboundMode) []const u8 {
     return switch (mode) {
         .token => "Callers must send the token below. Nothing else can reach the tools.",

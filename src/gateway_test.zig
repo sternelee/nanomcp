@@ -1,6 +1,5 @@
 //! The gateway as a client sees it: over HTTP, behind its caller check, and
-//! through the MCP endpoint. These are the Go original's gateway and auth
-//! tests, driven over a real loopback socket.
+//! through the MCP endpoint, driven over a real loopback socket.
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
@@ -401,9 +400,8 @@ fn refused_header(answer: web.Answer, name: []const u8) ?[]const u8 {
 }
 
 // The gateway against a real upstream: a helper program that speaks MCP over
-// its standard streams, the way the Go original's test binary served itself
-// over stdio. The tests that need more than one server of these are in
-// `gateway_flow_test.zig`.
+// its standard streams. The tests that need more than one server of these are
+// in `gateway_flow_test.zig`.
 
 /// A helper upstream's shell script: it answers the gateway's handshake and
 /// its tools. `$0` is the text its echo tool answers with, so a test can tell

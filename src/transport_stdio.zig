@@ -213,7 +213,7 @@ pub const Stdio = struct {
     }
 };
 
-/// The last lines a child wrote to stderr, capped like Go's ring buffer.
+/// The last lines a child wrote to stderr, kept in a capped ring buffer.
 pub const Logs = struct {
     a: std.mem.Allocator,
     mu: Io.Mutex = .init,

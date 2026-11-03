@@ -1,5 +1,5 @@
-//! The gateway as its own authorization server: the authorization-server cases
-//! of the Go original's auth_test.go, driven over real loopback sockets.
+//! The gateway as its own authorization server: the authorization-server cases,
+//! driven over real loopback sockets.
 const std = @import("std");
 const json = @import("json_util.zig");
 const oauth_client = @import("oauth_client.zig");

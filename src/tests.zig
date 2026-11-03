@@ -75,3 +75,28 @@ test "the routes registry records a session, longest connected first" {
     try std.testing.expectEqualStrings("b", left[0].id);
     try std.testing.expect(registry.remove(a, "a") == null);
 }
+
+test "a session identifier is only known once the gateway opens it" {
+    var registry = @import("sessions.zig").Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+
+    try std.testing.expect(!registry.known(""));
+    try std.testing.expect(!registry.known("invented"));
+    registry.connected("sess-1", 10);
+    try std.testing.expect(registry.known("sess-1"));
+}
+
+test "the routes table drops the longest-idle sessions once it is full" {
+    var registry = @import("sessions.zig").Registry.init(std.testing.allocator, std.testing.io);
+    defer registry.deinit();
+
+    var buf: [32]u8 = undefined;
+    for (0..600) |i| {
+        const id = try std.fmt.bufPrint(&buf, "sess-{d}", .{i});
+        registry.connected(id, @intCast(i));
+        registry.disconnected(id, @intCast(i));
+    }
+    try std.testing.expect(registry.count() <= 512);
+    try std.testing.expect(!registry.known("sess-0"));
+    try std.testing.expect(registry.known("sess-599"));
+}

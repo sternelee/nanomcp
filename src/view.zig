@@ -32,7 +32,6 @@ pub fn view(s: *App, c: *ui.Context) void {
     // opened from another page, as the Market's add form is.
     if (s.page != .servers) s.servers.menu = null;
 
-    c.frameIn(0.5);
     kit.keys(c, s, server_dialogs.anyOpen(s));
     const root = ui.div(c).row().sizeFull().bg(k.page);
     defer root.end();
@@ -64,6 +63,11 @@ pub fn view(s: *App, c: *ui.Context) void {
             tray.setTitle(menubar.titleInto(&buf, agents));
         }
     }
+    // A caret blinks on a half-second beat. Paced only by its own next
+    // change, the link idles at one or two frames a second and samples the
+    // blink at its own period: the dialog appears to flicker. While a field
+    // has the focus, keep a steady, fine enough beat to show it honestly.
+    if (c.focused_text != null and c.window_focused) c.frameIn(1.0 / 15.0);
 }
 
 /// The pages, the mark, and the gateway's state: the sidebar beside every

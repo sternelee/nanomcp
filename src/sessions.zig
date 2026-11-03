@@ -143,6 +143,15 @@ pub const Registry = struct {
         return left.connected_at < right.connected_at;
     }
 
+    /// Whether a session identifier is one this registry opened. A client that
+    /// invents one is not recorded under it.
+    pub fn known(s: *Self, id: []const u8) bool {
+        if (id.len == 0) return false;
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        return s.map.contains(id);
+    }
+
     /// How many sessions there are, connected or not.
     pub fn count(s: *Self) usize {
         s.mu.lockUncancelable(s.io);
@@ -189,12 +198,51 @@ pub const Registry = struct {
 
     fn entry(s: *Self, id: []const u8) !*Entry {
         if (s.map.get(id)) |e| return e;
+        s.pruneLocked();
         const key = try s.a.dupe(u8, id);
         errdefer s.a.free(key);
         const e = try s.a.create(Entry);
+        errdefer s.a.destroy(e);
         e.* = .{ .id = key };
         try s.map.put(s.a, key, e);
         return e;
+    }
+
+    /// The most sessions the table keeps. A client that never says goodbye
+    /// must not make the list grow without bound.
+    const max_entries: usize = 512;
+
+    /// Drops the longest-idle sessions that are no longer connected, and the
+    /// longest-idle of all if every one is still connected.
+    fn pruneLocked(s: *Self) void {
+        while (s.map.count() >= max_entries) {
+            var victim: ?[]const u8 = null;
+            var oldest: i64 = std.math.maxInt(i64);
+            var it = s.map.iterator();
+            while (it.next()) |kv| {
+                const e = kv.value_ptr.*;
+                if (e.connected) continue;
+                if (victim == null or e.last_active < oldest) {
+                    oldest = e.last_active;
+                    victim = kv.key_ptr.*;
+                }
+            }
+            if (victim == null) {
+                var all = s.map.iterator();
+                while (all.next()) |kv| {
+                    const e = kv.value_ptr.*;
+                    if (e.last_active < oldest) {
+                        oldest = e.last_active;
+                        victim = kv.key_ptr.*;
+                    }
+                }
+            }
+            const id = victim orelse return;
+            if (s.map.fetchRemove(id)) |gone| {
+                s.freeEntry(gone.value);
+                s.a.free(gone.key);
+            }
+        }
     }
 };
 

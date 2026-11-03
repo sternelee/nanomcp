@@ -14,6 +14,9 @@ pub const refresh_ttl: i64 = 30 * 24 * 60 * 60;
 /// How long an authorization code may wait to be exchanged.
 pub const code_ttl: i64 = 5 * 60;
 
+/// How long a consent page stays good once it has been shown.
+pub const consent_ttl: i64 = 10 * 60;
+
 /// The scope every token carries: the gateway is one resource.
 pub const scope = "mcp";
 
@@ -40,6 +43,17 @@ pub const AuthCode = struct {
     expires_at: i64,
 };
 
+/// A consent page the user was shown: the request it described, so the form
+/// that comes back can be matched against the page rather than trusted.
+pub const Consent = struct {
+    client_id: []const u8,
+    redirect_uri: []const u8,
+    challenge: []const u8,
+    scope: []const u8,
+    state: []const u8,
+    expires_at: i64 = 0,
+};
+
 /// What a code exchange produced.
 pub const Issued = struct {
     access: []const u8,
@@ -60,6 +74,7 @@ pub const IssuedTokens = struct {
     refresh: std.StringHashMapUnmanaged(TokenRecord) = .empty,
     clients: std.StringHashMapUnmanaged(ClientRecord) = .empty,
     codes: std.StringHashMapUnmanaged(AuthCode) = .empty,
+    consents: std.StringHashMapUnmanaged(Consent) = .empty,
 
     /// A store that lives in memory only, which is what a test wants.
     pub fn initMemory(a: std.mem.Allocator, io: Io) IssuedTokens {
@@ -109,6 +124,17 @@ pub const IssuedTokens = struct {
             a.free(kv.value_ptr.scope);
         }
         s.codes.deinit(a);
+
+        var oit2 = s.consents.iterator();
+        while (oit2.next()) |kv| {
+            a.free(kv.key_ptr.*);
+            a.free(kv.value_ptr.client_id);
+            a.free(kv.value_ptr.redirect_uri);
+            a.free(kv.value_ptr.challenge);
+            a.free(kv.value_ptr.scope);
+            a.free(kv.value_ptr.state);
+        }
+        s.consents.deinit(a);
 
         if (s.path.len > 0) a.free(s.path);
     }
@@ -276,6 +302,69 @@ pub const IssuedTokens = struct {
         return kv.value;
     }
 
+    /// Remembers the request a consent page described, under a token that is
+    /// put into the page. The token is what proves the form came from a page
+    /// the user actually saw.
+    pub fn newConsent(s: *IssuedTokens, consent: Consent, now: i64) ![]u8 {
+        const a = s.a;
+        const value = try randomToken(a, s.io);
+        errdefer a.free(value);
+
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        s.pruneConsentsLocked(now) catch {};
+        try s.consents.put(a, value, .{
+            .client_id = try a.dupe(u8, consent.client_id),
+            .redirect_uri = try a.dupe(u8, consent.redirect_uri),
+            .challenge = try a.dupe(u8, consent.challenge),
+            .scope = try a.dupe(u8, consent.scope),
+            .state = try a.dupe(u8, consent.state),
+            .expires_at = now + consent_ttl,
+        });
+        return value;
+    }
+
+    /// Takes a consent out of the store, so it can be approved exactly once.
+    /// The values are copied into `out_a`, which is the caller's arena.
+    pub fn takeConsent(s: *IssuedTokens, id: []const u8, now: i64, out_a: std.mem.Allocator) !?Consent {
+        if (id.len == 0) return null;
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        s.pruneConsentsLocked(now) catch {};
+        const kv = s.consents.fetchRemove(id) orelse return null;
+        defer {
+            s.a.free(kv.key);
+            s.a.free(kv.value.client_id);
+            s.a.free(kv.value.redirect_uri);
+            s.a.free(kv.value.challenge);
+            s.a.free(kv.value.scope);
+            s.a.free(kv.value.state);
+        }
+        return .{
+            .client_id = try out_a.dupe(u8, kv.value.client_id),
+            .redirect_uri = try out_a.dupe(u8, kv.value.redirect_uri),
+            .challenge = try out_a.dupe(u8, kv.value.challenge),
+            .scope = try out_a.dupe(u8, kv.value.scope),
+            .state = try out_a.dupe(u8, kv.value.state),
+            .expires_at = kv.value.expires_at,
+        };
+    }
+
+    /// Frees the access and refresh tokens an issue or renew produced. The
+    /// store only keeps their hashes.
+    pub fn freeIssued(s: *IssuedTokens, issued: Issued) void {
+        s.a.free(issued.access);
+        s.a.free(issued.refresh);
+    }
+
+    /// Frees the strings of a code that was taken out of the store.
+    pub fn freeAuthCode(s: *IssuedTokens, code: AuthCode) void {
+        s.a.free(code.client_id);
+        s.a.free(code.redirect_uri);
+        s.a.free(code.challenge);
+        s.a.free(code.scope);
+    }
+
     fn putToken(s: *IssuedTokens, map: *std.StringHashMapUnmanaged(TokenRecord), token: []const u8, record: TokenRecord) !void {
         const a = s.a;
         const hash = try hashToken(a, token);
@@ -331,6 +420,25 @@ pub const IssuedTokens = struct {
                 s.a.free(kv.value.redirect_uri);
                 s.a.free(kv.value.challenge);
                 s.a.free(kv.value.scope);
+            }
+        }
+    }
+
+    fn pruneConsentsLocked(s: *IssuedTokens, now: i64) !void {
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(s.a);
+        var it = s.consents.iterator();
+        while (it.next()) |kv| {
+            if (now > kv.value_ptr.expires_at) try stale.append(s.a, kv.key_ptr.*);
+        }
+        for (stale.items) |id| {
+            if (s.consents.fetchRemove(id)) |kv| {
+                s.a.free(kv.key);
+                s.a.free(kv.value.client_id);
+                s.a.free(kv.value.redirect_uri);
+                s.a.free(kv.value.challenge);
+                s.a.free(kv.value.scope);
+                s.a.free(kv.value.state);
             }
         }
     }
@@ -528,6 +636,62 @@ test "a code is exchanged exactly once" {
         .expires_at = 0,
     }, now);
     try std.testing.expect(store.takeCode(expired, now + code_ttl + 1) == null);
+}
+
+test "a consent can be used once, and only while it is fresh" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var store = IssuedTokens.initMemory(a, std.testing.io);
+    defer store.deinit();
+
+    const now: i64 = 900;
+    const id = try store.newConsent(.{
+        .client_id = "client-a",
+        .redirect_uri = "http://127.0.0.1:9999/cb",
+        .challenge = "abc",
+        .scope = scope,
+        .state = "st-1",
+    }, now);
+    const taken = (try store.takeConsent(id, now, a)).?;
+    try std.testing.expectEqualStrings("client-a", taken.client_id);
+    try std.testing.expectEqualStrings("http://127.0.0.1:9999/cb", taken.redirect_uri);
+    try std.testing.expectEqualStrings("abc", taken.challenge);
+    try std.testing.expectEqualStrings("st-1", taken.state);
+    // A consent is a single use: a replayed form finds nothing.
+    try std.testing.expect((try store.takeConsent(id, now, a)) == null);
+
+    const expired = try store.newConsent(.{
+        .client_id = "client-a",
+        .redirect_uri = "http://127.0.0.1:9999/cb",
+        .challenge = "abc",
+        .scope = scope,
+        .state = "",
+    }, now);
+    try std.testing.expect((try store.takeConsent(expired, now + consent_ttl + 1, a)) == null);
+}
+
+test "the tokens a store mints are freed by the caller" {
+    const gpa = std.testing.allocator;
+    var store = IssuedTokens.initMemory(gpa, std.testing.io);
+    defer store.deinit();
+
+    const now: i64 = 700;
+    const issued = try store.issue("client-a", scope, now);
+    const renewed = try store.renew(issued.refresh, "client-a", now + 1);
+    store.freeIssued(issued);
+    store.freeIssued(renewed);
+
+    const code = try store.newCode(.{
+        .client_id = "client-a",
+        .redirect_uri = "http://127.0.0.1:9999/cb",
+        .challenge = "abc",
+        .scope = scope,
+        .expires_at = 0,
+    }, now);
+    const taken = store.takeCode(code, now).?;
+    store.freeAuthCode(taken);
 }
 
 test "revoking every token leaves the registered clients" {

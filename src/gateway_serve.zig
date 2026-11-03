@@ -106,15 +106,19 @@ pub fn stop(g: *Gateway) void {
     g.port = 0;
     g.mu.unlock(g.io);
 
-    disconnectAll(g);
-    g.pending.clear(g.a);
+    // The listener goes first: a handler may still be calling a tool, and
+    // disconnecting its server out from under it would free it mid-call.
     if (listener) |l| {
         // An event stream waits on its client, so it is ended before the
         // listener waits for the connections that were serving it.
         @import("mcp_endpoint.zig").sessions.closeAll();
         l.stop();
         l.destroy();
+        @import("mcp_endpoint.zig").sessions.deinit();
     }
+
+    disconnectAll(g);
+    g.pending.clear(g.a);
     g.note("", "gateway stopped", false);
     g.changed();
 }
@@ -128,17 +132,28 @@ pub fn wakeWaiters(g: *Gateway) void {
     while (it.next()) |kv| kv.value_ptr.*.sess.markClosed("gateway closing");
 }
 
-/// Disconnects every upstream and drops its tools and status.
+/// Disconnects every upstream and drops its tools and status. A connection
+/// that a call is still using stays alive until that call releases it.
 pub fn disconnectAll(g: *Gateway) void {
     g.mu.lockUncancelable(g.io);
-    const ups = g.a.alloc(*upstream.Upstream, g.upstreams.count()) catch {
+    const count = g.upstreams.count();
+    const ups = g.a.alloc(*upstream.Upstream, count) catch {
+        g.mu.unlock(g.io);
+        return;
+    };
+    const last = g.a.alloc(bool, count) catch {
+        g.a.free(ups);
         g.mu.unlock(g.io);
         return;
     };
     var i: usize = 0;
     var it = g.upstreams.iterator();
     while (it.next()) |kv| : (i += 1) {
-        ups[i] = kv.value_ptr.*;
+        const up = kv.value_ptr.*;
+        ups[i] = up;
+        up.retired = true;
+        up.refs -= 1;
+        last[i] = up.refs == 0;
         g.tools.removeServer(kv.key_ptr.*);
         g.forgetStatus(kv.key_ptr.*);
     }
@@ -146,12 +161,18 @@ pub fn disconnectAll(g: *Gateway) void {
     while (keys.next()) |k| g.a.free(k.*);
     g.upstreams.clearRetainingCapacity();
     g.mu.unlock(g.io);
+    if (i > 0) @import("mcp_endpoint.zig").notifyToolsChanged(g);
 
-    for (ups[0..i]) |up| {
-        up.close();
-        up.destroy();
+    for (ups[0..i], last[0..i]) |up, is_last| {
+        if (is_last) {
+            up.close();
+            up.destroy();
+        } else {
+            up.sess.markClosed("gateway closing");
+        }
     }
     g.a.free(ups);
+    g.a.free(last);
 }
 
 /// Whether the gateway is listening.

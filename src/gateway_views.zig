@@ -96,7 +96,7 @@ pub fn endpoints(g: *Gateway, a: std.mem.Allocator) ![]const []const u8 {
 pub fn healthJSON(g: *Gateway, a: std.mem.Allocator) ![]u8 {
     var doc: json.J = .object(a);
     doc.put("status", .str(a, "ok"));
-    doc.put("tools", .int(a, @intCast(g.tools.map.count())));
+    doc.put("tools", .int(a, @intCast(g.tools.count())));
     return doc.dump();
 }
 
@@ -115,7 +115,7 @@ pub fn metaToolJSON(g: *Gateway, a: std.mem.Allocator) ![]u8 {
         list.add(row);
     }
     doc.put("servers", list);
-    doc.put("tools", .int(a, @intCast(g.tools.map.count())));
+    doc.put("tools", .int(a, @intCast(g.tools.count())));
     return doc.dumpIndent();
 }
 

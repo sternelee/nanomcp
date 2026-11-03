@@ -2,9 +2,11 @@
 //! the handshake it was given, and the tools it published.
 const std = @import("std");
 const Io = std.Io;
+const auth = @import("auth.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const json = @import("json_util.zig");
+const oauth_client = @import("oauth_client.zig");
 const rpc = @import("rpc.zig");
 const session = @import("session.zig");
 const web = @import("http_client.zig");
@@ -29,27 +31,109 @@ pub const Outcome = union(enum) {
     failed: []const u8,
 };
 
+/// How close to expiry a token is renewed, so a request that carries it
+/// still lands before the server stops accepting it.
+pub const refresh_skew_seconds = 60;
+
+/// Whether a stored token should be traded for a fresh one before it goes on
+/// the wire. A token that never expires, or one with no refresh token, is
+/// left alone: there is nothing to trade.
+pub fn needsRefresh(token: credentials.Token, now: i64) bool {
+    if (token.expires_at == 0) return false;
+    if (token.refresh_token == null or token.refresh_token.?.len == 0) return false;
+    return token.isExpired(now) or now + refresh_skew_seconds >= token.expires_at;
+}
+
 /// Reads the token a sign-in produced, so every request to a server that has
-/// one carries it.
+/// one carries it. A token near expiry is renewed with its refresh token
+/// first, so a long-lived connection does not start failing when the access
+/// token runs out.
 pub const Bearer = struct {
     creds: *credentials.CredentialStore,
     /// The credential key, worked out once rather than per request.
     key: []const u8,
+    /// The gateway's allocator, for the discovery a renewal needs; and the
+    /// clock, since a token's expiry is wall time.
+    scratch: std.mem.Allocator,
+    io: Io,
+    server_id: []const u8,
+    resource_url: []const u8,
+    /// Serializes renewals, so a token near expiry is not refreshed once per
+    /// request in flight.
+    mu: Io.Mutex = .init,
 
     fn headerOf(ctx: *anyopaque, a: std.mem.Allocator) ?[]u8 {
         const self: *Bearer = @ptrCast(@alignCast(ctx));
-        const raw = self.creds.text(self.key);
+        const raw = self.creds.text(a, self.key);
+        defer if (raw.len > 0) a.free(raw);
         if (raw.len == 0) return null;
-        const doc = json.parse(a, raw) catch return null;
-        const token = json.getString(doc, "access_token") orelse return null;
-        if (token.len == 0) return null;
+        const stored = tokenAt(json.parse(a, raw) catch return null);
+        if (stored.access_token.len == 0) return null;
+        var token = stored.access_token;
+        if (needsRefresh(stored, auth.now(self.io))) {
+            if (self.renew(a)) |fresh| token = fresh;
+        }
         return std.fmt.allocPrint(a, "Bearer {s}", .{token}) catch null;
+    }
+
+    /// Trades the stored refresh token for a fresh access token and saves it.
+    /// Returns the new token in `a`; null when the exchange fails, in which
+    /// case the old token is still what goes on the wire.
+    fn renew(self: *Bearer, a: std.mem.Allocator) ?[]u8 {
+        if (self.resource_url.len == 0) return null;
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+
+        var arena_state = std.heap.ArenaAllocator.init(self.scratch);
+        defer arena_state.deinit();
+        const aa = arena_state.allocator();
+
+        const raw = self.creds.text(aa, self.key);
+        if (raw.len == 0) return null;
+        const stored = tokenAt(json.parse(aa, raw) catch return null);
+        // A request that waited on the lock may find the token renewed by the
+        // one before it.
+        if (!needsRefresh(stored, auth.now(self.io))) return a.dupe(u8, stored.access_token) catch null;
+        const refresh_token = stored.refresh_token orelse return null;
+
+        var client = web.Client.init(aa, self.io);
+        defer client.deinit();
+        const discovery = oauth_client.discover(aa, &client, self.resource_url, "") catch return null;
+        const cc = self.creds.client(aa, self.server_id);
+        var fresh = oauth_client.refresh(
+            aa,
+            self.io,
+            &client,
+            discovery,
+            cc.client_id,
+            cc.secret orelse "",
+            refresh_token,
+        ) catch return null;
+        // A response that leaves the refresh token out means the one already
+        // stored stays in use.
+        if (fresh.refresh_token == null or fresh.refresh_token.?.len == 0) fresh.refresh_token = refresh_token;
+        var store = self.creds.tokenStore(aa, self.server_id) catch return null;
+        store.save(fresh) catch return null;
+        return a.dupe(u8, fresh.access_token) catch null;
     }
 
     fn wire(b: *Bearer) web.Bearer {
         return .{ .ctx = b, .header = headerOf };
     }
 };
+
+/// A stored token, as the JSON it was saved as carries it.
+fn tokenAt(doc: json.Value) credentials.Token {
+    return .{
+        .issuer = json.getString(doc, "issuer"),
+        .access_token = json.getString(doc, "access_token") orelse "",
+        .token_type = json.getString(doc, "token_type") orelse "",
+        .refresh_token = json.getString(doc, "refresh_token"),
+        .expires_in = json.getInt(doc, "expires_in") orelse 0,
+        .scope = json.getString(doc, "scope"),
+        .expires_at = json.getInt(doc, "expires_at") orelse 0,
+    };
+}
 
 /// What connecting needs from the gateway that owns it.
 pub const Options = struct {
@@ -112,6 +196,11 @@ pub const Upstream = struct {
     sess: session.Session,
     /// The tool definitions the server published, as it sent them.
     tools: []json.Value,
+    /// Protected by the gateway's mutex: how many calls hold it, and whether
+    /// it has been taken out of the registry. The last holder frees it, so a
+    /// call is never running against freed memory.
+    refs: usize = 1,
+    retired: bool = false,
 
     pub fn close(u: *Upstream) void {
         u.sess.deinit();
@@ -121,6 +210,8 @@ pub const Upstream = struct {
         const a = u.a;
         u.sess.deinit();
         u.link.destroy();
+        for (u.tools) |tool| json.free(a, tool);
+        a.free(u.tools);
         a.destroy(u);
     }
 
@@ -249,7 +340,14 @@ fn startLink(a: std.mem.Allocator, io: Io, sc: config.ServerConfig, opts: Option
     if (opts.creds) |creds| {
         if (oauthFor(a, sc, opts)) {
             const bearer = try a.create(Bearer);
-            bearer.* = .{ .creds = creds, .key = try credentials.CredentialStore.tokenKey(a, sc.id) };
+            bearer.* = .{
+                .creds = creds,
+                .key = try credentials.CredentialStore.tokenKey(a, sc.id),
+                .scratch = a,
+                .io = io,
+                .server_id = sc.id,
+                .resource_url = sc.url orelse "",
+            };
             switch (link) {
                 .stdio => {},
                 .http => |t| t.setBearer(bearer.wire()),
@@ -390,6 +488,18 @@ test "a server with a token of its own is not signed in to" {
     };
     try std.testing.expect(oauthFor(a, signing_in, .{ .creds = &store }));
     try std.testing.expect(!oauthFor(a, signing_in, .{}));
+}
+
+test "a token is refreshed when it has expired or is about to" {
+    try std.testing.expect(needsRefresh(.{ .access_token = "a", .refresh_token = "r", .expires_at = 1_000 }, 1_100));
+    // The skew leaves time for the request to land before the server stops
+    // accepting the token.
+    try std.testing.expect(needsRefresh(.{ .access_token = "a", .refresh_token = "r", .expires_at = 1_030 }, 1_000));
+    try std.testing.expect(!needsRefresh(.{ .access_token = "a", .refresh_token = "r", .expires_at = 2_000 }, 1_000));
+
+    // A token with no refresh token, or one that never expires, is left alone.
+    try std.testing.expect(!needsRefresh(.{ .access_token = "a", .expires_at = 1 }, 1_100));
+    try std.testing.expect(!needsRefresh(.{ .access_token = "a", .refresh_token = "r", .expires_at = 0 }, 1_100));
 }
 
 test "configured headers and the stored token both go on the request" {

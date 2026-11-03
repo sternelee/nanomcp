@@ -78,7 +78,7 @@ fn removeDialog(c: *ui.Context, s: *App, k: theme.Colors, id: []const u8) void {
     _ = win.interaction();
 
     ui.text(c, c.print("Remove \u{201c}{s}\u{201d}?", .{sc.name}), .{ .size = 16, .weight = .bold, .color = k.text });
-    ui.text(c, "Its tools are withdrawn from the gateway, and its saved sign-in is forgotten.", .{ .size = 12, .color = k.secondary });
+    ui.text(c, "Its tools are withdrawn from the gateway, and its saved sign-in is forgotten.", .{ .size = 12, .color = k.secondary, .wrap = true });
     const buttons = ui.div(c).row().wFull().gap(8).itemsCenter();
     defer buttons.end();
     ui.spacer(c);
@@ -111,6 +111,7 @@ fn importDialog(c: *ui.Context, s: *App, k: theme.Colors) void {
     ui.text(c, "The mcpServers block from Claude Desktop, Cursor or VS Code works as it stands. A server whose name is already here is replaced.", .{
         .size = 12,
         .color = k.secondary,
+        .wrap = true,
     });
 
     ui.text(c, "Configuration", .{ .size = 11, .weight = .semibold, .color = k.tertiary });
@@ -123,7 +124,7 @@ fn importDialog(c: *ui.Context, s: *App, k: theme.Colors) void {
         }
     }
 
-    if (s.servers.import_error.len > 0) ui.text(c, s.servers.import_error, .{ .size = 12, .color = k.red });
+    if (s.servers.import_error.len > 0) ui.text(c, s.servers.import_error, .{ .size = 12, .color = k.red, .wrap = true });
 
     const buttons = ui.div(c).row().wFull().gap(8).itemsCenter();
     defer buttons.end();
@@ -168,7 +169,7 @@ fn editorDialog(c: *ui.Context, s: *App, k: theme.Colors, id: []const u8) void {
     const action = editor.build(&s.servers.form, c, k, s.servers.form.mode == .add, &s.servers.focus_form);
     scroll.end();
 
-    if (s.servers.form_error.len > 0) ui.text(c, s.servers.form_error, .{ .size = 12, .color = k.red });
+    if (s.servers.form_error.len > 0) ui.text(c, s.servers.form_error, .{ .size = 12, .color = k.red, .wrap = true });
 
     const buttons = ui.div(c).row().wFull().gap(8).itemsCenter().pt(2);
     defer buttons.end();

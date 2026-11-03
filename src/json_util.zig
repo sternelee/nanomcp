@@ -144,6 +144,62 @@ pub fn isObject(v: Value) bool {
     return v == .object;
 }
 
+/// Copies a value into `a`, so it no longer depends on the buffer it was
+/// parsed from.
+pub fn clone(a: std.mem.Allocator, v: Value) !Value {
+    switch (v) {
+        .null, .bool, .integer, .float, .number_string => return v,
+        .string => |s| return .{ .string = try a.dupe(u8, s) },
+        .array => |arr| {
+            var out: Array = .init(a);
+            errdefer {
+                for (out.items) |item| free(a, item);
+                out.deinit();
+            }
+            for (arr.items) |item| try out.append(try clone(a, item));
+            return .{ .array = out };
+        },
+        .object => |o| {
+            var out: Object = .empty;
+            errdefer {
+                var it = out.iterator();
+                while (it.next()) |kv| {
+                    a.free(kv.key_ptr.*);
+                    free(a, kv.value_ptr.*);
+                }
+                out.deinit(a);
+            }
+            var it = o.iterator();
+            while (it.next()) |kv| {
+                try out.put(a, try a.dupe(u8, kv.key_ptr.*), try clone(a, kv.value_ptr.*));
+            }
+            return .{ .object = out };
+        },
+    }
+}
+
+/// Frees a value made by `clone`.
+pub fn free(a: std.mem.Allocator, v: Value) void {
+    switch (v) {
+        .null, .bool, .integer, .float, .number_string => {},
+        .string => |s| a.free(s),
+        .array => |arr| {
+            var out = arr;
+            for (out.items) |item| free(a, item);
+            out.deinit();
+        },
+        .object => |o| {
+            var out = o;
+            var it = out.iterator();
+            while (it.next()) |kv| {
+                a.free(kv.key_ptr.*);
+                free(a, kv.value_ptr.*);
+            }
+            out.deinit(a);
+        },
+    }
+}
+
 test "a document is written compactly and read back" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

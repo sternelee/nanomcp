@@ -239,6 +239,48 @@ test "signing out forgets the token and the server asks for authorization again"
     try std.testing.expectEqual(@as(usize, 0), f.g.toolCount("s1"));
 }
 
+test "an expired upstream token is refreshed instead of failing the request" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const upstream = try fixtures.FakeUpstream.start(std.testing.io);
+    defer upstream.stop();
+
+    const f = try fixtures.Serving.start(a, std.testing.io, &.{.{
+        .id = "s1",
+        .name = "Protected",
+        .alias = "protected",
+        .transport = .http,
+        .url = try upstream.mcpUrl(a),
+        .oauth = true,
+        .enabled = true,
+    }});
+    defer f.stop();
+
+    // A token that expired long ago, with the refresh token and the client
+    // registration a sign-in leaves behind.
+    const key = try credentials.CredentialStore.tokenKey(a, "s1");
+    try f.store.set(key, "{\"access_token\":\"stale-token\",\"token_type\":\"Bearer\"," ++
+        "\"refresh_token\":\"test-refresh-token\",\"expires_in\":3600,\"expires_at\":1}");
+    try f.store.saveClient(a, "s1", .{ .client_id = "registered-client" });
+
+    // Connecting refreshes it first, so the request carries a token the
+    // server still accepts.
+    try f.g.reconnect("s1");
+    try std.testing.expectEqual(Status.ready, f.g.statusOf("s1"));
+    try std.testing.expectEqual(@as(usize, 1), upstream.refreshes);
+    try std.testing.expectEqual(@as(usize, 0), upstream.tokens);
+    try std.testing.expectEqualStrings("Bearer " ++ upstream_token, upstream.sent.items);
+
+    // The fresh token replaces the stale one, and the refresh token the
+    // response left out is the one already stored.
+    const token = (try f.store.loadToken(a, "s1")).?;
+    try std.testing.expectEqualStrings(upstream_token, token.access_token);
+    try std.testing.expectEqualStrings("test-refresh-token", token.refresh_token.?);
+    try std.testing.expect(token.expires_at > auth.now(f.io));
+}
+
 test "a server that does not sign in with OAuth cannot begin a flow" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

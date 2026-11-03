@@ -56,6 +56,9 @@ pub const Fixture = struct {
         @import("mcp_endpoint.zig").sessions.closeAll();
         f.listener.stop();
         f.listener.destroy();
+        // The registry's memory belongs to this fixture's arena, so it goes
+        // before the arena does.
+        @import("mcp_endpoint.zig").sessions.deinit();
         f.client.deinit();
         _ = f.g.deinit();
         f.store.deinit();
@@ -74,6 +77,54 @@ fn bearerHeader(a: std.mem.Allocator, token: []const u8) ![]web.Header {
     const headers = try a.alloc(web.Header, 1);
     headers[0] = .{ .name = "authorization", .value = try std.fmt.allocPrint(a, "Bearer {s}", .{token}) };
     return headers;
+}
+
+test "a caller's token is checked against the configured one" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const f = try Fixture.start(a, std.testing.io);
+    defer f.stop();
+
+    f.cfg.inbound = .token;
+    try f.store.setInboundToken("s3cret");
+    f.g.refreshCredentials();
+
+    const now = auth.now(std.testing.io);
+    try std.testing.expect(f.g.authorized("s3cret", now));
+    try std.testing.expect(!f.g.authorized("s3cret ", now));
+    try std.testing.expect(!f.g.authorized("", now));
+
+    // A token that was changed in the settings is not accepted any more.
+    try f.store.setInboundToken("n3w");
+    f.g.refreshCredentials();
+    try std.testing.expect(!f.g.authorized("s3cret", now));
+    try std.testing.expect(f.g.authorized("n3w", now));
+}
+
+test "a session identifier the gateway never issued is not adopted" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const f = try Fixture.start(a, std.testing.io);
+    defer f.stop();
+
+    const headers = [_]web.Header{
+        .{ .name = "content-type", .value = "application/json" },
+        .{ .name = "mcp-session-id", .value = "invented" },
+    };
+    const body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"," ++
+        "\"params\":{\"protocolVersion\":\"2025-06-18\",\"clientInfo\":{\"name\":\"probe\",\"version\":\"1\"}}}";
+    const answer = try f.request(.POST, "/mcp", &headers, body);
+    try std.testing.expectEqual(@as(u16, 200), answer.status);
+
+    // The invented name is ignored: the gateway hands out one of its own.
+    try std.testing.expect(!f.g.routes.known("invented"));
+    const issued = refused_header(answer, "mcp-session-id") orelse return error.NoSession;
+    try std.testing.expect(!std.mem.eql(u8, issued, "invented"));
+    try std.testing.expect(f.g.routes.known(issued));
 }
 
 test "the gateway refuses callers without the token, and lets them in with it" {

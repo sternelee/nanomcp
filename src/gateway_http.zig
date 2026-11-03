@@ -18,6 +18,17 @@ pub fn handle(ctx: *anyopaque, req: *server.Request) anyerror!void {
     const g: *gateway_mod.Gateway = @ptrCast(@alignCast(ctx));
     const path = req.path;
 
+    // A request that changes state is only accepted from the gateway's own
+    // pages. A page open elsewhere must not be able to make a browser approve
+    // a client or drive a tool call.
+    if (req.method == .POST) {
+        const origin = req.header("origin") orelse "";
+        if (origin.len > 0 and !auth.originAllowed(origin, try gateway_views.baseURL(g, req.a))) {
+            try req.respond(.{ .status = .forbidden, .body = "cross-origin request refused" });
+            return;
+        }
+    }
+
     // Everything that serves the tool surface is behind the caller check. The
     // discovery endpoints below stay open, since a client has to reach them in
     // order to obtain the credential in the first place. Each guarded endpoint
@@ -56,14 +67,8 @@ fn guarded(
     const mode = g.cfg.inboundMode();
     if (!mode.requiresToken()) return next(g, req);
 
-    g.mu.lockUncancelable(g.io);
-    const want = g.auth_token;
-    g.mu.unlock(g.io);
-
     const presented = auth.bearerToken(req);
-    if (presented.len > 0 and (auth.sameToken(presented, want) or g.tokens.accepts(presented, auth.now(g.io)))) {
-        return next(g, req);
-    }
+    if (g.authorized(presented, auth.now(g.io))) return next(g, req);
     return rejectUnauthorized(g, req, resource_path);
 }
 
@@ -196,22 +201,50 @@ fn handleAuthorize(g: *gateway_mod.Gateway, req: *server.Request) !void {
         return authorizeRedirectError(req, redirect_uri, state, "invalid_request", "PKCE with code_challenge_method=S256 is required");
     }
 
+    const scope = (try auth.formValue(a, source, "scope")) orelse auth.auth_scope;
+
     if (req.method == .GET) {
+        // The page gets a token that names the request it described. The form
+        // has to bring it back, which is what proves the user saw this page
+        // rather than an attacker's copy of it.
+        const consent_token = g.tokens.newConsent(.{
+            .client_id = client_id,
+            .redirect_uri = redirect_uri,
+            .challenge = challenge,
+            .scope = if (scope.len > 0) scope else auth.auth_scope,
+            .state = state,
+        }, auth.now(g.io)) catch {
+            return authorizeError(req, "server_error", "the consent page could not be prepared");
+        };
+
         var fields: std.ArrayList(server.Header) = .empty;
         for ([_][]const u8{ "client_id", "redirect_uri", "response_type", "code_challenge", "code_challenge_method", "scope", "state" }) |name| {
             const value = (try auth.formValue(a, source, name)) orelse "";
             try fields.append(a, .{ .name = name, .value = value });
         }
+        try fields.append(a, .{ .name = "consent_token", .value = consent_token });
         const page = try auth.consentPage(a, client_id, redirect_uri, fields.items);
         try req.respond(.{ .content_type = "text/html; charset=utf-8", .body = page });
         return;
     }
 
+    const consent_token = (try auth.formValue(a, source, "consent_token")) orelse "";
+    const consent = (try g.tokens.takeConsent(consent_token, auth.now(g.io), a)) orelse {
+        return authorizeRedirectError(req, redirect_uri, state, "invalid_request", "the consent form has expired; start the sign-in again");
+    };
+    if (!std.mem.eql(u8, consent.client_id, client_id) or
+        !std.mem.eql(u8, consent.redirect_uri, redirect_uri) or
+        !std.mem.eql(u8, consent.challenge, challenge) or
+        !std.mem.eql(u8, consent.state, state))
+    {
+        return authorizeRedirectError(req, redirect_uri, state, "invalid_request", "the consent form does not match this request");
+    }
+
     const code = g.tokens.newCode(.{
-        .client_id = client_id,
-        .redirect_uri = redirect_uri,
-        .challenge = challenge,
-        .scope = auth.auth_scope,
+        .client_id = consent.client_id,
+        .redirect_uri = consent.redirect_uri,
+        .challenge = consent.challenge,
+        .scope = if (consent.scope.len > 0) consent.scope else auth.auth_scope,
         .expires_at = 0,
     }, auth.now(g.io)) catch {
         return authorizeRedirectError(req, redirect_uri, state, "server_error", "the code could not be issued");
@@ -243,6 +276,7 @@ fn handleToken(g: *gateway_mod.Gateway, req: *server.Request) !void {
     const issued = g.tokens.renew(refresh, client_id, auth.now(g.io)) catch {
         return oauthError(req, .bad_request, "invalid_grant", "the refresh token is not valid for this client");
     };
+    defer g.tokens.freeIssued(issued);
     return tokenResponse(req, issued.access, null, issued.expires_at - auth.now(g.io));
 }
 
@@ -256,6 +290,7 @@ fn exchangeCode(g: *gateway_mod.Gateway, req: *server.Request, client_id: []cons
     const record = g.tokens.takeCode(code, auth.now(g.io)) orelse {
         return oauthError(req, .bad_request, "invalid_grant", "the code is unknown, expired or already used");
     };
+    defer g.tokens.freeAuthCode(record);
     if (!std.mem.eql(u8, record.client_id, client_id)) {
         return oauthError(req, .bad_request, "invalid_grant", "the code was issued to another client");
     }
@@ -271,6 +306,7 @@ fn exchangeCode(g: *gateway_mod.Gateway, req: *server.Request, client_id: []cons
     const issued = g.tokens.issue(client_id, record.scope, auth.now(g.io)) catch {
         return oauthError(req, .internal_server_error, "server_error", "the token could not be issued");
     };
+    defer g.tokens.freeIssued(issued);
     g.note("", "issued an access token to an OAuth client", false);
     g.changed();
     return tokenResponse(req, issued.access, issued.refresh, issued.expires_at - auth.now(g.io));

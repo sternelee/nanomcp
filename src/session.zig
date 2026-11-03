@@ -268,23 +268,7 @@ pub fn freeArena(a: std.mem.Allocator, arena: *std.heap.ArenaAllocator) void {
 
 /// Copies a value into another allocator, so it outlives the buffer it came in.
 pub fn clone(a: std.mem.Allocator, v: json.Value) !json.Value {
-    switch (v) {
-        .null, .bool, .integer, .float, .number_string => return v,
-        .string => |s| return .{ .string = try a.dupe(u8, s) },
-        .array => |arr| {
-            var out: json.Array = .init(a);
-            for (arr.items) |item| try out.append(try clone(a, item));
-            return .{ .array = out };
-        },
-        .object => |o| {
-            var out: json.Object = .empty;
-            var it = o.iterator();
-            while (it.next()) |kv| {
-                try out.put(a, try a.dupe(u8, kv.key_ptr.*), try clone(a, kv.value_ptr.*));
-            }
-            return .{ .object = out };
-        },
-    }
+    return json.clone(a, v);
 }
 
 /// A wire that answers every request on the spot, the way a fast server would.

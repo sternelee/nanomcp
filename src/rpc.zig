@@ -9,6 +9,15 @@ pub const J = json.J;
 pub const latest_version = "2025-06-18";
 pub const supported_versions = [_][]const u8{ latest_version, "2025-03-26", "2024-11-05" };
 
+/// The revision to answer an initialize with: the one the client asked for
+/// when the gateway speaks it, and otherwise the newest it does.
+pub fn negotiateVersion(asked: []const u8) []const u8 {
+    for (supported_versions) |version| {
+        if (std.mem.eql(u8, asked, version)) return version;
+    }
+    return latest_version;
+}
+
 /// The error codes JSON-RPC defines.
 pub const parse_error: i64 = -32700;
 pub const invalid_request: i64 = -32600;

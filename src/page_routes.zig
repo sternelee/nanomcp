@@ -35,6 +35,9 @@ pub fn page(c: *ui.Context, s: *App, k: theme.Colors) void {
         return;
     }
 
+    // "connected 4m ago" is time-relative: redraw once a minute so it stays
+    // true without the window drawing while nothing changes.
+    c.frameIn(60);
     const now = auth.now(s.io);
     for (live.items) |agent| routeRow(c, k, agent, now);
 }

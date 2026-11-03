@@ -180,12 +180,14 @@ pub const CredentialStore = struct {
         return std.fs.path.join(f.gpa, parts);
     }
 
-    /// Reads a secret kept as plain text, or "" when there is none.
-    /// The value leaks into the arena the store was built with, because a
-    /// caller that wants to render it cannot free it mid-frame.
-    pub fn text(c: *CredentialStore, key: []const u8) []const u8 {
+    /// Reads a secret kept as plain text, copied into `a`, or "" when there is
+    /// none. The store's own copy is freed here, so the caller only has its
+    /// own to deal with.
+    pub fn text(c: *CredentialStore, a: std.mem.Allocator, key: []const u8) []const u8 {
         const value = c.get(key) catch return "";
-        return value orelse "";
+        const owned = value orelse return "";
+        defer c.allocatorOf().free(owned);
+        return a.dupe(u8, owned) catch "";
     }
 
     /// Writes a plain-text secret, forgetting it when it is blank. This is
@@ -199,7 +201,7 @@ pub const CredentialStore = struct {
     pub fn upstreamToken(c: *CredentialStore, a: std.mem.Allocator, server_id: []const u8) []const u8 {
         const key = upstreamTokenKey(a, server_id) catch return "";
         defer a.free(key);
-        return c.text(key);
+        return c.text(a, key);
     }
 
     /// Whether a server has a static token, without revealing it.
@@ -214,9 +216,10 @@ pub const CredentialStore = struct {
         try c.setSecret(key, value);
     }
 
-    /// The bearer token callers of the gateway must present, or "".
-    pub fn inboundToken(c: *CredentialStore) []const u8 {
-        return c.text(inbound_token_key);
+    /// The bearer token callers of the gateway must present, copied into `a`,
+    /// or "".
+    pub fn inboundToken(c: *CredentialStore, a: std.mem.Allocator) []const u8 {
+        return c.text(a, inbound_token_key);
     }
 
     /// Saves the token callers must present, or clears it.
@@ -321,11 +324,22 @@ test "the inbound token is kept until it is cleared" {
     var store: CredentialStore = .initMemory(a);
     defer store.deinit();
 
-    try std.testing.expectEqualStrings("", store.inboundToken());
+    try std.testing.expectEqualStrings("", store.inboundToken(a));
     try store.setInboundToken("callers-must-present-this");
-    try std.testing.expectEqualStrings("callers-must-present-this", store.inboundToken());
+    try std.testing.expectEqualStrings("callers-must-present-this", store.inboundToken(a));
     try store.setInboundToken("");
-    try std.testing.expectEqualStrings("", store.inboundToken());
+    try std.testing.expectEqualStrings("", store.inboundToken(a));
+}
+
+test "reading a secret frees the store's copy" {
+    const gpa = std.testing.allocator;
+    var store: CredentialStore = .initMemory(gpa);
+    defer store.deinit();
+
+    try store.setInboundToken("callers-must-present-this");
+    const got = store.inboundToken(gpa);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("callers-must-present-this", got);
 }
 
 test "a token is saved, read back and forgotten" {

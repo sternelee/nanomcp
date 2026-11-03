@@ -161,15 +161,18 @@ pub const Gateway = struct {
         g.listener = null;
         g.port = 0;
         g.mu.unlock(g.io);
-        lifecycle.disconnectAll(g);
-        g.pending.clear(g.a);
+        // The listener goes first, so no handler is still using a connection
+        // when the connections are torn down.
         if (listener) |l| {
             // An event stream waits on its client, so it is ended before the
             // listener waits for the connections that were serving it.
             @import("mcp_endpoint.zig").sessions.closeAll();
             l.stop();
             l.destroy();
+            @import("mcp_endpoint.zig").sessions.deinit();
         }
+        lifecycle.disconnectAll(g);
+        g.pending.clear(g.a);
         g.tools.deinit();
         g.tokens.deinit();
         g.routes.deinit();
@@ -283,13 +286,58 @@ pub const Gateway = struct {
     /// its upstream is an error here, which the endpoint reports as a tool
     /// error so the calling model sees it and can react.
     pub fn callTool(g: *Gateway, a: std.mem.Allocator, name: []const u8, args: ?json.Value) !json.Value {
-        const entry = g.tools.find(name) orelse return error.UnknownTool;
+        // Copied, because a sync on another thread may drop this tool from
+        // the registry while the call is under way.
+        const entry = (try g.tools.findCopy(a, name)) orelse return error.UnknownTool;
+        defer entry.deinit(a);
 
+        // A reference keeps the connection alive even if the server is
+        // disconnected while the call is waiting for its answer.
+        const up = g.acquireUpstream(entry.server_id) orelse return error.NotConnected;
+        defer g.releaseUpstream(up);
+        return up.callTool(a, entry.upstream_name, args);
+    }
+
+    /// Takes a reference to a connected upstream. The caller releases it.
+    fn acquireUpstream(g: *Gateway, id: []const u8) ?*upstream.Upstream {
         g.mu.lockUncancelable(g.io);
-        const up = g.upstreams.get(entry.server_id);
+        defer g.mu.unlock(g.io);
+        const up = g.upstreams.get(id) orelse return null;
+        up.refs += 1;
+        return up;
+    }
+
+    fn releaseUpstream(g: *Gateway, up: *upstream.Upstream) void {
+        g.mu.lockUncancelable(g.io);
+        up.refs -= 1;
+        const last = up.refs == 0 and up.retired;
         g.mu.unlock(g.io);
-        const connected = up orelse return error.NotConnected;
-        return connected.callTool(a, entry.upstream_name, args);
+        if (last) up.destroy();
+    }
+
+    /// Takes a server out of the registry, waking the calls still using it:
+    /// the last of them frees it, so nothing is freed under a live call.
+    fn retire(g: *Gateway, id: []const u8) void {
+        g.mu.lockUncancelable(g.io);
+        const kv = g.upstreams.fetchRemove(id) orelse {
+            g.mu.unlock(g.io);
+            return;
+        };
+        g.a.free(kv.key);
+        const up = kv.value;
+        up.retired = true;
+        up.refs -= 1;
+        const last = up.refs == 0;
+        g.mu.unlock(g.io);
+
+        if (last) {
+            up.close();
+            up.destroy();
+        } else {
+            // Whatever is waiting on this connection learns that it is gone
+            // now, instead of at its own timeout.
+            up.sess.markClosed("the server was disconnected");
+        }
     }
 
     /// Reads the credential store: which servers can sign in, and the token
@@ -300,25 +348,49 @@ pub const Gateway = struct {
             // A remote server with no token of its own is one that signs in.
             if (sc.transport != .stdio and headerText(sc.token_header).len == 0) {
                 const signed = g.creds.signedIn(a, sc.id, auth.now(g.io));
+                g.mu.lockUncancelable(g.io);
                 g.putMap(bool, &g.signed_in, sc.id, signed);
+                g.mu.unlock(g.io);
             }
         }
 
         const needs = g.cfg.inboundMode().requiresToken();
-        const token = if (needs) (g.creds.get(credentials.CredentialStore.inbound_token_key) catch null) else null;
+        var token: ?[]u8 = null;
+        var unreadable = false;
+        if (needs) {
+            token = g.creds.get(credentials.CredentialStore.inbound_token_key) catch blk: {
+                // A credential store that cannot be read is not a reason to
+                // keep honouring the token that was there before: the token
+                // may be exactly what was revoked.
+                unreadable = true;
+                break :blk null;
+            };
+        }
         defer if (token) |t| a.free(t);
 
         g.mu.lockUncancelable(g.io);
         defer g.mu.unlock(g.io);
-        if (token != null or !needs) {
-            g.a.free(@constCast(g.auth_token));
-            g.auth_token = g.a.dupe(u8, token orelse "") catch "";
-        }
+        g.a.free(@constCast(g.auth_token));
+        const fresh = if (!needs or unreadable) "" else (token orelse "");
+        g.auth_token = g.a.dupe(u8, fresh) catch "";
+    }
+
+    /// Whether a caller presented the token the gateway requires, or one the
+    /// gateway issued. The configured token is compared under the lock: a
+    /// settings change replaces its memory.
+    pub fn authorized(g: *Gateway, presented: []const u8, now: i64) bool {
+        if (presented.len == 0) return false;
+        g.mu.lockUncancelable(g.io);
+        const same = auth.sameToken(presented, g.auth_token);
+        g.mu.unlock(g.io);
+        return same or g.tokens.accepts(presented, now);
     }
 
     /// Records a server's sign-in state without reading the credential store,
     /// for a change the gateway itself just made.
     pub fn markSignedIn(g: *Gateway, server_id: []const u8, signed: bool) void {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
         g.putMap(bool, &g.signed_in, server_id, signed);
     }
 
@@ -348,7 +420,6 @@ pub const Gateway = struct {
                 stale.append(g.a, kv.value_ptr.*) catch {};
             }
             for (stale.items) |up| {
-                _ = g.upstreams.fetchRemove(up.config.id);
                 g.forgetStatus(up.config.id);
                 g.tools.removeServer(up.config.id);
             }
@@ -364,12 +435,12 @@ pub const Gateway = struct {
         }
         g.mu.unlock(g.io);
         g.changed();
+        if (stale.items.len > 0) @import("mcp_endpoint.zig").notifyToolsChanged(g);
 
         for (stale.items) |up| {
             g.note(up.config.id, try std.fmt.allocPrint(g.a, "disconnected {s}", .{up.config.name}), false);
-            up.close();
-            up.destroy();
         }
+        for (stale.items) |up| g.retire(up.config.id);
 
         // One server that cannot connect does not stop the others: its reason
         // is recorded against it, and the first such reason is what the
@@ -392,16 +463,14 @@ pub const Gateway = struct {
         g.refreshCredentials();
 
         g.mu.lockUncancelable(g.io);
-        const old = g.upstreams.fetchRemove(id);
+        const had_connection = g.upstreams.get(id) != null;
         g.forgetStatus(id);
         g.tools.removeServer(id);
         const sc = g.cfg.server(id);
         g.mu.unlock(g.io);
+        if (had_connection) @import("mcp_endpoint.zig").notifyToolsChanged(g);
 
-        if (old) |kv| {
-            kv.value.close();
-            kv.value.destroy();
-        }
+        if (had_connection) g.retire(id);
         const target = sc orelse return error.NoSuchServer;
         if (!target.enabled) {
             g.setStatus(id, .disabled, "");
@@ -442,6 +511,7 @@ pub const Gateway = struct {
                 g.register(up);
                 g.note(sc.id, try std.fmt.allocPrint(a, "{s}: {d} tools", .{ sc.name, up.tools.len }), false);
                 g.changed();
+                @import("mcp_endpoint.zig").notifyToolsChanged(g);
             },
         }
     }

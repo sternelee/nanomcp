@@ -68,6 +68,36 @@ test "the gateway registers a client, approves it, and issues tokens that open t
     try std.testing.expectEqual(@as(u16, 200), (try f.request(.GET, "/healthz", try fixtures.bearerHeader(a, "s3cret"), null)).status);
 }
 
+test "a form that never saw the consent page is refused" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const f = try fixtures.Serving.start(a, std.testing.io, &.{});
+    defer f.stop();
+    f.serveAsAuthServer("s3cret");
+
+    const client = try f.register(a);
+
+    // A page open elsewhere can post the fields, but not the token the consent
+    // page carried, so no code is handed out.
+    const fields = authorizeFields(client.client_id, client.challenge, "the-state");
+    const refused = try f.postForm("/oauth/authorize", &fields);
+    try std.testing.expectEqual(@as(u16, 302), refused.status);
+    const location = (try refused.headerValue(a, "location")).?;
+    try std.testing.expect(std.mem.startsWith(u8, location, redirect_uri));
+    try std.testing.expectEqualStrings("invalid_request", (try auth.queryValue(a, try fixtures.queryOf(location), "error")).?);
+    try std.testing.expect((try auth.queryValue(a, try fixtures.queryOf(location), "code")) == null);
+
+    // A made-up token is no better.
+    var forged_fields: [fields.len + 1]auth.Pair = undefined;
+    for (fields, 0..) |field, i| forged_fields[i] = field;
+    forged_fields[fields.len] = .{ .name = "consent_token", .value = "made-up" };
+    const forged = try f.postForm("/oauth/authorize", &forged_fields);
+    try std.testing.expectEqual(@as(u16, 302), forged.status);
+    try std.testing.expectEqualStrings("invalid_request", (try auth.queryValue(a, try fixtures.queryOf((try forged.headerValue(a, "location")).?), "error")).?);
+}
+
 test "a token exchange checks the proof, and a failed exchange burns the code" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -129,8 +159,12 @@ test "an OAuth client signs in with the gateway's authorization server and opens
     // The browser approves the authorization URL the client built.
     const verifier = try tokens.randomToken(a, f.io);
     const url = try oauth_client.authorizationUrl(a, discovery, client.client_id, redirect_uri, "the-state", verifier, discovery.scope);
-    try std.testing.expectEqual(@as(u16, 200), (try f.requestUrl(.GET, url, &.{}, null)).status);
-    const fields = authorizeFields(client.client_id, try oauth_client.pkceChallenge(a, verifier), "the-state");
+    const page = try f.requestUrl(.GET, url, &.{}, null);
+    try std.testing.expectEqual(@as(u16, 200), page.status);
+    const visible = authorizeFields(client.client_id, try oauth_client.pkceChallenge(a, verifier), "the-state");
+    var fields: [visible.len + 1]auth.Pair = undefined;
+    for (visible, 0..) |field, i| fields[i] = field;
+    fields[visible.len] = .{ .name = "consent_token", .value = try fixtures.consentTokenOf(page.body) };
     const approved = try f.postForm("/oauth/authorize", &fields);
     try std.testing.expectEqual(@as(u16, 302), approved.status);
     const code = try fixtures.codeOf(a, (try approved.headerValue(a, "location")).?);

@@ -21,6 +21,16 @@ pub const Entry = struct {
     server_id: []const u8,
     /// The name the upstream knows it by.
     upstream_name: []const u8,
+
+    /// Frees an entry that owns its strings, as one from `list` or `findCopy`
+    /// does.
+    pub fn deinit(e: Entry, a: std.mem.Allocator) void {
+        a.free(e.name);
+        a.free(e.description);
+        a.free(e.server_id);
+        a.free(e.upstream_name);
+        json.free(a, e.schema);
+    }
 };
 
 /// The tools of every server that is connected.
@@ -39,21 +49,34 @@ pub const Registry = struct {
         r.map.deinit(r.a);
     }
 
-    /// Adds a tool, replacing one of the same name.
+    /// Adds a tool, replacing one of the same name. The registry owns its own
+    /// copy of everything, including the schema, which outlives the server
+    /// that published it.
     pub fn add(r: *Registry, entry: Entry) !void {
         const a = r.a;
         const name = try a.dupe(u8, entry.name);
         errdefer a.free(name);
+        const description = try a.dupe(u8, entry.description);
+        errdefer a.free(description);
+        const server_id = try a.dupe(u8, entry.server_id);
+        errdefer a.free(server_id);
+        const upstream_name = try a.dupe(u8, entry.upstream_name);
+        errdefer a.free(upstream_name);
+        const schema = try json.clone(a, entry.schema);
+        errdefer json.free(a, schema);
 
         r.mu.lockUncancelable(r.io);
         defer r.mu.unlock(r.io);
-        if (r.map.fetchRemove(entry.name)) |old| freeEntry(a, old.value);
+        if (r.map.fetchRemove(entry.name)) |old| {
+            a.free(old.key);
+            freeEntry(a, old.value);
+        }
         try r.map.put(a, name, .{
             .name = name,
-            .description = try a.dupe(u8, entry.description),
-            .schema = entry.schema,
-            .server_id = try a.dupe(u8, entry.server_id),
-            .upstream_name = try a.dupe(u8, entry.upstream_name),
+            .description = description,
+            .schema = schema,
+            .server_id = server_id,
+            .upstream_name = upstream_name,
         });
     }
 
@@ -78,6 +101,13 @@ pub const Registry = struct {
         }
     }
 
+    /// How many tools the gateway offers.
+    pub fn count(r: *Registry) usize {
+        r.mu.lockUncancelable(r.io);
+        defer r.mu.unlock(r.io);
+        return r.map.count();
+    }
+
     /// How many tools a server offers.
     pub fn countFor(r: *Registry, server_id: []const u8) usize {
         r.mu.lockUncancelable(r.io);
@@ -90,14 +120,19 @@ pub const Registry = struct {
         return n;
     }
 
-    /// Every tool, by name.
+    /// Every tool, by name, copied into `a` so the answer stays valid while
+    /// another thread reconciles the registry.
     pub fn list(r: *Registry, a: std.mem.Allocator) ![]Entry {
         r.mu.lockUncancelable(r.io);
         defer r.mu.unlock(r.io);
         const out = try a.alloc(Entry, r.map.count());
         var i: usize = 0;
+        errdefer {
+            for (out[0..i]) |entry| entry.deinit(a);
+            a.free(out);
+        }
         var it = r.map.valueIterator();
-        while (it.next()) |entry| : (i += 1) out[i] = entry.*;
+        while (it.next()) |entry| : (i += 1) out[i] = try copyEntry(a, entry.*);
         std.mem.sort(Entry, out, {}, byName);
         return out;
     }
@@ -107,6 +142,15 @@ pub const Registry = struct {
         r.mu.lockUncancelable(r.io);
         defer r.mu.unlock(r.io);
         return r.map.get(name);
+    }
+
+    /// One tool, copied into `a` so a call can use it after the registry has
+    /// moved on.
+    pub fn findCopy(r: *Registry, a: std.mem.Allocator, name: []const u8) !?Entry {
+        r.mu.lockUncancelable(r.io);
+        defer r.mu.unlock(r.io);
+        const entry = r.map.get(name) orelse return null;
+        return try copyEntry(a, entry);
     }
 
     pub fn clear(r: *Registry) void {
@@ -126,12 +170,32 @@ pub const Registry = struct {
     }
 
     fn freeEntry(a: std.mem.Allocator, entry: Entry) void {
-        a.free(entry.name);
+        // The name is the map's key, freed by whoever removes the entry.
         a.free(entry.description);
         a.free(entry.server_id);
         a.free(entry.upstream_name);
+        json.free(a, entry.schema);
     }
 };
+
+/// Copies an entry and everything it points at into `a`.
+fn copyEntry(a: std.mem.Allocator, entry: Entry) !Entry {
+    const name = try a.dupe(u8, entry.name);
+    errdefer a.free(name);
+    const description = try a.dupe(u8, entry.description);
+    errdefer a.free(description);
+    const server_id = try a.dupe(u8, entry.server_id);
+    errdefer a.free(server_id);
+    const upstream_name = try a.dupe(u8, entry.upstream_name);
+    errdefer a.free(upstream_name);
+    return .{
+        .name = name,
+        .description = description,
+        .schema = try json.clone(a, entry.schema),
+        .server_id = server_id,
+        .upstream_name = upstream_name,
+    };
+}
 
 /// The name a gateway tool goes by.
 pub fn prefixedName(a: std.mem.Allocator, alias: []const u8, tool_name: []const u8) ![]u8 {
@@ -196,4 +260,70 @@ test "a description with no upstream text still says where it came from" {
     try std.testing.expectEqualStrings("From Git.", try describe(a, "Git", ""));
     try std.testing.expectEqualStrings("[Git] Commit.", try describe(a, "Git", "Commit."));
     try std.testing.expectEqualStrings("files__ls", try prefixedName(a, "files", "ls"));
+}
+
+test "a listed tool keeps its own text and schema when its server goes away" {
+    const gpa = std.testing.allocator;
+
+    var source_state = std.heap.ArenaAllocator.init(gpa);
+    const source = source_state.allocator();
+    const schema = try json.parse(source,
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}");
+
+    var r = Registry.init(gpa, std.testing.io);
+    defer r.deinit();
+    try r.add(.{
+        .name = "filesystem__read_file",
+        .description = "Read a file.",
+        .schema = schema,
+        .server_id = "s1",
+        .upstream_name = "read_file",
+    });
+    // The schema the caller handed in is gone after this, so the registry
+    // must have made its own copy.
+    source_state.deinit();
+
+    const listed = try r.list(gpa);
+    defer {
+        for (listed) |entry| entry.deinit(gpa);
+        gpa.free(listed);
+    }
+
+    const inner = r.find("filesystem__read_file").?;
+    // The list owns its strings; they are not the registry's to free.
+    try std.testing.expect(listed[0].name.ptr != inner.name.ptr);
+    try std.testing.expect(listed[0].description.ptr != inner.description.ptr);
+    try std.testing.expect(listed[0].server_id.ptr != inner.server_id.ptr);
+    try std.testing.expect(listed[0].upstream_name.ptr != inner.upstream_name.ptr);
+
+    r.removeServer("s1");
+    try std.testing.expectEqualStrings("filesystem__read_file", listed[0].name);
+    try std.testing.expectEqualStrings("Read a file.", listed[0].description);
+    try std.testing.expectEqualStrings("object", json.getString(listed[0].schema, "type").?);
+    try std.testing.expectEqualStrings("string", json.getString(
+        json.get(json.get(listed[0].schema, "properties").?, "path").?,
+        "type",
+    ).?);
+}
+
+test "a tool found for a call is copied out of the registry" {
+    const gpa = std.testing.allocator;
+
+    var r = Registry.init(gpa, std.testing.io);
+    defer r.deinit();
+    try r.add(.{
+        .name = "git__status",
+        .description = "Worktree status.",
+        .schema = .{ .object = .empty },
+        .server_id = "s2",
+        .upstream_name = "status",
+    });
+
+    const found = (try r.findCopy(gpa, "git__status")).?;
+    defer found.deinit(gpa);
+
+    r.removeServer("s2");
+    try std.testing.expectEqualStrings("git__status", found.name);
+    try std.testing.expectEqualStrings("status", found.upstream_name);
+    try std.testing.expect((try r.findCopy(gpa, "git__status")) == null);
 }

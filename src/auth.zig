@@ -69,14 +69,36 @@ pub fn pkceMatches(verifier: []const u8, challenge: []const u8) bool {
     return sameToken(expected, challenge);
 }
 
-/// Whether a redirect URI is one a browser may be sent to.
+/// Whether a redirect URI is one a browser may be sent to. The URI ends up in
+/// a Location header, so anything that could break out of it — a control
+/// character, a space, a quote, a backslash — is refused, as is a fragment,
+/// which a browser would swallow along with the code.
 pub fn validRedirectURI(uri: []const u8) bool {
+    for (uri) |c| {
+        if (c <= 0x20 or c == 0x7f or c == '#' or c == '"' or c == '\\') return false;
+    }
     const scheme_end = std.mem.indexOf(u8, uri, "://") orelse return false;
     const scheme = uri[0..scheme_end];
     if (!std.ascii.eqlIgnoreCase(scheme, "http") and !std.ascii.eqlIgnoreCase(scheme, "https")) return false;
     const rest = uri[scheme_end + 3 ..];
-    const host_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
-    return host_end > 0;
+    const host_end = std.mem.indexOfAny(u8, rest, "/?") orelse rest.len;
+    if (host_end == 0) return false;
+    // Userinfo would let "http://127.0.0.1@evil.example/" pass as loopback.
+    return std.mem.indexOfScalar(u8, rest[0..host_end], '@') == null;
+}
+
+/// Whether a browser request came from the gateway itself. A request without
+/// an Origin header did not come from a browser and is left alone; a browser on
+/// this machine may reach the gateway as either 127.0.0.1 or localhost.
+pub fn originAllowed(origin: []const u8, base: []const u8) bool {
+    if (origin.len == 0) return true;
+    if (std.ascii.eqlIgnoreCase(origin, base)) return true;
+    const loopback = "http://127.0.0.1";
+    const localhost = "http://localhost";
+    if (std.ascii.startsWithIgnoreCase(base, loopback) and std.ascii.startsWithIgnoreCase(origin, localhost)) {
+        return std.mem.eql(u8, base[loopback.len..], origin[localhost.len..]);
+    }
+    return false;
 }
 
 /// The host of a URL, for showing where a browser is about to go.
@@ -379,6 +401,35 @@ test "only http redirect URIs are trusted" {
     try std.testing.expect(!validRedirectURI("http:///cb"));
     try std.testing.expect(!validRedirectURI("127.0.0.1/cb"));
     try std.testing.expectEqualStrings("127.0.0.1:33418", hostOf("http://127.0.0.1:33418/callback"));
+}
+
+test "a redirect URI cannot smuggle a header break or a fragment" {
+    // A newline in the Location header would let a client inject headers.
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\r\nX-Injected: yes"));
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\nX-Injected: yes"));
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\r"));
+    // A fragment would be swallowed by the browser, dropping the code.
+    try std.testing.expect(!validRedirectURI("http://example.com/cb#frag"));
+    // Spaces, quotes and backslashes do not belong in a URL.
+    try std.testing.expect(!validRedirectURI("http://exa mple.com/cb"));
+    try std.testing.expect(!validRedirectURI("http://example.com/c b"));
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\"x"));
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\\x"));
+    // Control characters are never part of a URI.
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\x00"));
+    try std.testing.expect(!validRedirectURI("http://example.com/cb\x7f"));
+}
+
+test "a browser request from another site is refused" {
+    const base = "http://127.0.0.1:7777";
+    // No Origin at all means a command-line client, not a browser page.
+    try std.testing.expect(originAllowed("", base));
+    try std.testing.expect(originAllowed(base, base));
+    try std.testing.expect(originAllowed("http://localhost:7777", base));
+    try std.testing.expect(!originAllowed("http://evil.example", base));
+    try std.testing.expect(!originAllowed("http://localhost:7778", base));
+    try std.testing.expect(!originAllowed("https://127.0.0.1:7777", base));
+    try std.testing.expect(!originAllowed("http://127.0.0.1:7777/", base));
 }
 
 test "a form body and a query string are read the same way" {

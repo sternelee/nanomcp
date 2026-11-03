@@ -285,3 +285,73 @@ test "the filter narrows the rows and says when nothing matches" {
     try t.clickText("Clear the filter");
     try std.testing.expect(t.hasText("Filesystem"));
 }
+
+test "an idle window asks for no frames" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{ui_test.stdioServer()});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    t.advance(1);
+    t.frame();
+    try std.testing.expect(t.ctx.frame_in == null);
+}
+
+test "a focused field keeps a fine, steady beat for its caret" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    try t.clickText("Paste a configuration…");
+    t.frame();
+    try std.testing.expect(t.ctx.frame_in != null);
+    // A caret sampled twice a second aliases its own blink: the dialog
+    // appears to flicker. While a field has the focus the window keeps a
+    // beat fine enough to show the caret on and off regularly.
+    try std.testing.expect(t.ctx.frame_in.? <= 1.0 / 15.0 + 1e-6);
+}
+
+test "the paste dialog's description wraps inside the dialog" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    try t.clickText("Paste a configuration…");
+    t.frame();
+    const r = t.findText("The mcpServers block from Claude Desktop, Cursor or VS Code works as it stands. A server whose name is already here is replaced.") orelse
+        return error.TextNotFound;
+    // The dialog is 520 points wide, with 20 points of padding each side.
+    try std.testing.expectApproxEqAbs(@as(f32, 480), r.w, 1);
+}
+
+test "the remove dialog's description wraps inside the dialog" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{ui_test.stdioServer()});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    try t.clickText("Remove");
+    t.frame();
+    const r = t.findText("Its tools are withdrawn from the gateway, and its saved sign-in is forgotten.") orelse
+        return error.TextNotFound;
+    // The dialog is 400 points wide, with 20 points of padding each side.
+    try std.testing.expectApproxEqAbs(@as(f32, 360), r.w, 1);
+}

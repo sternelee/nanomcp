@@ -39,6 +39,15 @@ pub fn authorizeUrl(a: std.mem.Allocator, base: []const u8, client_id: []const u
     return auth.withQuery(a, try std.fmt.allocPrint(a, "{s}/oauth/authorize", .{base}), &fields);
 }
 
+/// The token the consent page carries in its form, which proves the form came
+/// from a page the user was shown.
+pub fn consentTokenOf(page: []const u8) ![]const u8 {
+    const marker = "name=\"consent_token\" value=\"";
+    const start = (std.mem.indexOf(u8, page, marker) orelse return error.NoConsent) + marker.len;
+    const end = std.mem.indexOfScalarPos(u8, page, start, '"') orelse return error.NoConsent;
+    return page[start..end];
+}
+
 /// The authorization code a redirect carried back.
 pub fn codeOf(a: std.mem.Allocator, location: []const u8) ![]const u8 {
     const start = std.mem.findScalar(u8, location, '?') orelse return error.NoQuery;
@@ -166,7 +175,10 @@ pub const Serving = struct {
         try std.testing.expect(std.mem.indexOf(u8, page.body, "Allow this client") != null);
         try std.testing.expect(std.mem.indexOf(u8, page.body, client_id) != null);
 
-        const fields = authorizeFields(client_id, challenge, state);
+        const visible = authorizeFields(client_id, challenge, state);
+        var fields: [visible.len + 1]auth.Pair = undefined;
+        for (visible, 0..) |field, i| fields[i] = field;
+        fields[visible.len] = .{ .name = "consent_token", .value = try consentTokenOf(page.body) };
         const approved = try f.postForm("/oauth/authorize", &fields);
         try std.testing.expectEqual(@as(u16, 302), approved.status);
         return (try approved.headerValue(a, "location")).?;
@@ -206,6 +218,8 @@ pub const FakeUpstream = struct {
     registrations: usize = 0,
     /// How many codes were exchanged for a token.
     tokens: usize = 0,
+    /// How many refresh tokens were exchanged for a fresh access token.
+    refreshes: usize = 0,
 
     pub fn start(io: Io) !*FakeUpstream {
         const gpa = std.testing.allocator;
@@ -302,6 +316,20 @@ pub const FakeUpstream = struct {
         // The code exchange: the code is accepted once, and the token it
         // yields is the one the protected resource accepts.
         if (std.mem.eql(u8, req.path, "/token")) {
+            const grant = (try auth.formValue(req.a, req.body, "grant_type")) orelse "";
+            if (std.mem.eql(u8, grant, "refresh_token")) {
+                const refresh_token = (try auth.formValue(req.a, req.body, "refresh_token")) orelse "";
+                if (!std.mem.eql(u8, refresh_token, "test-refresh-token")) {
+                    return req.respond(.{ .status = .bad_request, .body = "{\"error\":\"invalid_grant\"}" });
+                }
+                f.refreshes += 1;
+                // A refresh may leave the refresh token out, which means the
+                // one the client already has stays in use.
+                return req.respond(.{
+                    .headers = &.{.{ .name = "cache-control", .value = "no-store" }},
+                    .body = "{\"access_token\":\"" ++ upstream_token ++ "\",\"token_type\":\"Bearer\",\"expires_in\":3600}",
+                });
+            }
             const code = (try auth.formValue(req.a, req.body, "code")) orelse "";
             if (code.len == 0) return req.respond(.{ .status = .bad_request, .body = "{\"error\":\"invalid_grant\"}" });
             f.tokens += 1;

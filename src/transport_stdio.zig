@@ -14,6 +14,16 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// The longest line a child may send. A longer one is dropped rather than
+/// buffered, so a malformed server cannot exhaust the gateway's memory.
+const max_message_bytes: usize = 8 << 20;
+
+/// stderr is only kept to quote in a failure message.
+const max_log_bytes: usize = 64 << 10;
+
+/// How much of one stderr line is kept.
+const kept_log_bytes: usize = 512;
+
 /// A running child process and the pipes to it.
 pub const Stdio = struct {
     a: std.mem.Allocator,
@@ -22,7 +32,10 @@ pub const Stdio = struct {
     in: Io.File.Writer,
     /// What the child wrote to stderr, so a failure can quote it.
     logs: Logs,
-    dead: bool = false,
+    /// Serializes the messages written to the child's stdin, which arrive on
+    /// whichever thread a request happened to run on.
+    write_mu: Io.Mutex = .init,
+    dead: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     read_thread: ?std.Thread = null,
     log_thread: ?std.Thread = null,
     session: ?*session.Session = null,
@@ -92,17 +105,15 @@ pub const Stdio = struct {
         const buf = s.a.alloc(u8, 64 * 1024) catch return;
         defer s.a.free(buf);
         var reader = file.readerStreaming(s.io, buf);
-        var line_buf = std.ArrayList(u8).empty;
-        defer line_buf.deinit(s.a);
+        var line_buf: Io.Writer.Allocating = .init(s.a);
+        defer line_buf.deinit();
         while (true) {
-            const line = reader.interface.takeDelimiter('\n') catch break orelse break;
-            const trimmed = std.mem.trim(u8, line, " \t\r");
+            const more = readLine(&reader.interface, &line_buf, max_message_bytes) catch break;
+            if (!more) break;
+            const trimmed = std.mem.trim(u8, line_buf.written(), " \t\r");
             if (trimmed.len == 0) continue;
-            line_buf.clearRetainingCapacity();
-            line_buf.appendSlice(s.a, trimmed) catch break;
-            const text = line_buf.items;
             const arena = session.newArena(s.a) catch break;
-            const message = rpc.Message.parse(arena.allocator(), text);
+            const message = rpc.Message.parse(arena.allocator(), trimmed);
             if (s.session) |sess| {
                 sess.handleMessage(.{ .message = message, .arena = arena });
             } else session.freeArena(s.a, arena);
@@ -114,9 +125,12 @@ pub const Stdio = struct {
         const buf = s.a.alloc(u8, 4096) catch return;
         defer s.a.free(buf);
         var reader = file.readerStreaming(s.io, buf);
+        var line_buf: Io.Writer.Allocating = .init(s.a);
+        defer line_buf.deinit();
         while (true) {
-            const line = reader.interface.takeDelimiter('\n') catch break orelse break;
-            s.logs.add(line);
+            const more = readLine(&reader.interface, &line_buf, max_log_bytes) catch break;
+            if (!more) break;
+            s.logs.add(line_buf.written());
         }
     }
 
@@ -128,7 +142,9 @@ pub const Stdio = struct {
     fn sendBytes(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8) session.Error!void {
         _ = a;
         const s: *Stdio = @ptrCast(@alignCast(ctx));
-        if (s.dead) return error.Closed;
+        s.write_mu.lockUncancelable(s.io);
+        defer s.write_mu.unlock(s.io);
+        if (s.dead.load(.acquire)) return error.Closed;
         s.in.interface.writeAll(bytes) catch return error.WriteFailed;
         s.in.interface.writeAll("\n") catch return error.WriteFailed;
         s.in.interface.flush() catch return error.WriteFailed;
@@ -145,14 +161,21 @@ pub const Stdio = struct {
         a.destroy(s);
     }
 
-    /// Ends the conversation: closes the pipes and waits for the child.
+    /// Ends the conversation: closes the pipes and waits for the child. The
+    /// mutex is held across the check and the close, so no writer can be part
+    /// way through a message when its pipe goes away.
     pub fn close(s: *Stdio) void {
-        if (s.dead) return;
-        s.dead = true;
+        s.write_mu.lockUncancelable(s.io);
+        if (s.dead.load(.acquire)) {
+            s.write_mu.unlock(s.io);
+            return;
+        }
+        s.dead.store(true, .release);
         if (s.child.stdin) |f| {
             f.close(s.io);
             s.child.stdin = null;
         }
+        s.write_mu.unlock(s.io);
         if (s.child.id != null) s.child.kill(s.io);
         if (s.read_thread) |t| t.join();
         if (s.log_thread) |t| t.join();
@@ -163,7 +186,7 @@ pub const Stdio = struct {
 
     /// Whether the child is still running.
     pub fn alive(s: *Stdio) bool {
-        return !s.dead and s.child.id != null;
+        return !s.dead.load(.acquire) and s.child.id != null;
     }
 
     /// What the child said on stderr, for a failure message.
@@ -183,7 +206,7 @@ pub const Logs = struct {
     pub fn add(l: *Logs, line: []const u8) void {
         const trimmed = std.mem.trimEnd(u8, line, "\r");
         if (trimmed.len == 0) return;
-        const kept = l.a.dupe(u8, trimmed) catch return;
+        const kept = l.keep(trimmed) orelse return;
         l.mu.lockUncancelable(l.io);
         defer l.mu.unlock(l.io);
         l.lines.append(l.a, kept) catch {
@@ -194,6 +217,18 @@ pub const Logs = struct {
             const old = l.lines.orderedRemove(0);
             l.a.free(old);
         }
+    }
+
+    /// A line as it is kept: shortened to kept_log_bytes, on a character
+    /// boundary, with an ellipsis when something was cut.
+    fn keep(l: *Logs, line: []const u8) ?[]u8 {
+        if (line.len <= kept_log_bytes) return l.a.dupe(u8, line) catch null;
+        var end = kept_log_bytes;
+        while (end > 0 and (line[end] & 0xc0) == 0x80) end -= 1;
+        const out = l.a.alloc(u8, end + 3) catch return null;
+        @memcpy(out[0..end], line[0..end]);
+        @memcpy(out[end..], "...");
+        return out;
     }
 
     pub fn text(l: *Logs, a: std.mem.Allocator) ![]u8 {
@@ -214,6 +249,30 @@ pub const Logs = struct {
     }
 };
 
+/// Reads one line into `out`, however long it is, and consumes its newline.
+/// Returns false at the end of the stream. A line longer than `cap` is
+/// swallowed whole and left out of `out`, so the next call starts at the
+/// following line.
+fn readLine(reader: *Io.Reader, out: *Io.Writer.Allocating, cap: usize) !bool {
+    out.writer.end = 0;
+    _ = reader.streamDelimiterLimit(&out.writer, '\n', .limited(cap)) catch |err| switch (err) {
+        error.StreamTooLong => {
+            out.writer.end = 0;
+            _ = reader.discardDelimiterInclusive('\n') catch {};
+            return true;
+        },
+        else => return err,
+    };
+    // A found delimiter is the next buffered byte; a stream that ended before
+    // one leaves its last line in `out`.
+    const next = reader.peekByte() catch |err| switch (err) {
+        error.EndOfStream => return out.written().len > 0,
+        else => return err,
+    };
+    if (next == '\n') reader.toss(1);
+    return true;
+}
+
 fn copyEnv(a: std.mem.Allocator, parent: *const std.process.Environ.Map) !std.process.Environ.Map {
     var out = std.process.Environ.Map.init(a);
     errdefer out.deinit();
@@ -221,6 +280,88 @@ fn copyEnv(a: std.mem.Allocator, parent: *const std.process.Environ.Map) !std.pr
         try out.put(key, value);
     }
     return out;
+}
+
+test "a line longer than the cap is dropped, and the next one is still read" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var reader = Io.Reader.fixed("a-line-that-is-much-too-long\nshort\nend-with-no-newline");
+    var out: Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+
+    try std.testing.expect(try readLine(&reader, &out, 20));
+    // The over-long line is consumed, and contributes nothing.
+    try std.testing.expectEqual(@as(usize, 0), out.written().len);
+
+    try std.testing.expect(try readLine(&reader, &out, 20));
+    try std.testing.expectEqualStrings("short", out.written());
+
+    try std.testing.expect(try readLine(&reader, &out, 20));
+    try std.testing.expectEqualStrings("end-with-no-newline", out.written());
+
+    try std.testing.expect(!(try readLine(&reader, &out, 20)));
+}
+
+test "a long stderr line is shortened before it is shown" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    var logs: Logs = .{ .a = a, .io = std.testing.io };
+    defer logs.deinit();
+
+    const huge = try a.alloc(u8, 5000);
+    @memset(huge, 'x');
+    logs.add(huge);
+
+    const text = try logs.text(a);
+    try std.testing.expectEqual(@as(usize, 512 + 3), text.len);
+    try std.testing.expect(std.mem.endsWith(u8, text, "..."));
+    try std.testing.expect(std.mem.indexOf(u8, text, "\n") == null);
+}
+
+test "two threads writing to the child do not interleave their lines" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const s = try Stdio.start(a, std.testing.io, "/bin/sh", &.{ "-c", "cat" }, &.{}, null);
+    defer s.deinit();
+
+    const Writer = struct {
+        fn run(st: *Stdio, fill: u8, count: usize) void {
+            var line: [128]u8 = undefined;
+            @memset(&line, fill);
+            for (0..count) |_| Stdio.sendBytes(st, undefined, &line) catch return;
+        }
+    };
+    const t1 = try std.Thread.spawn(.{}, Writer.run, .{ s, 'a', 100 });
+    const t2 = try std.Thread.spawn(.{}, Writer.run, .{ s, 'b', 100 });
+    t1.join();
+    t2.join();
+    // The pipe can hold what was written, so the child is read only now.
+    s.child.stdin.?.close(s.io);
+    s.child.stdin = null;
+
+    var buf: [8192]u8 = undefined;
+    var reader = s.child.stdout.?.readerStreaming(s.io, &buf);
+    var seen_a: usize = 0;
+    var seen_b: usize = 0;
+    for (0..200) |_| {
+        const line = (try reader.interface.takeDelimiter('\n')) orelse return error.NoLine;
+        try std.testing.expectEqual(@as(usize, 128), line.len);
+        for (line) |c| try std.testing.expectEqual(line[0], c);
+        if (line[0] == 'a') {
+            seen_a += 1;
+        } else if (line[0] == 'b') {
+            seen_b += 1;
+        } else return error.UnexpectedByte;
+    }
+    try std.testing.expectEqual(@as(usize, 100), seen_a);
+    try std.testing.expectEqual(@as(usize, 100), seen_b);
 }
 
 test "a stdio server gets the app environment with its own values on top" {

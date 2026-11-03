@@ -1,0 +1,13 @@
+.{
+    .name = .mcp_go,
+    .version = "0.1.0",
+    .fingerprint = 0x2054f80228367ab4,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .nanoui = .{
+            .url = "git+https://github.com/justrach/nanoui?ref=v0.11.0#219f77acfe29d6cb521a388f7ed4a0d9c413007f",
+            .hash = "nanoui-0.11.0-we0KMbSAIwBQo1wV-FcCvOJNSg2AaUavAcvX24QjPJ7r",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

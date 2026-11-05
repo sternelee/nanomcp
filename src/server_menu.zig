@@ -21,7 +21,7 @@ pub fn draw(c: *ui.Context, s: *App, k: theme.Colors) void {
         s.servers.menu = null;
         return;
     };
-    const view = gateway_views.serverOf(s.gw, menu.id) catch null;
+    const view = gateway_views.serverOf(s.gw, c.arena.allocator(), menu.id) catch null;
 
     {
         const shade = ui.div(c).absolute().sizeFull().bg(k.page.alpha(0.05));

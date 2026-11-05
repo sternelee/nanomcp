@@ -218,6 +218,17 @@ pub const Session = struct {
         }
     }
 
+    /// Hands one message that arrived on the wire to the session. The arena
+    /// the message is parsed into comes from the session's own allocator,
+    /// because the session is what frees it: a transport that built it from
+    /// whatever allocator its caller happened to pass would leave the session
+    /// freeing memory it does not own.
+    pub fn handleBytes(s: *Session, text: []const u8) void {
+        const arena = newArena(s.a) catch return;
+        const message = rpc.Message.parse(arena.allocator(), text);
+        s.handleMessage(.{ .message = message, .arena = arena });
+    }
+
     /// Marks the connection as ended, waking everyone waiting on it.
     pub fn markClosed(s: *Session, reason: ?[]const u8) void {
         s.mu.lockUncancelable(s.io);

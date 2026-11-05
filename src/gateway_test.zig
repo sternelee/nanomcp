@@ -600,6 +600,34 @@ test "a server that cannot connect is reported without stopping the others" {
     try std.testing.expect(hasTool(try listedTools(f, a), "helper__echo"));
 }
 
+test "a server view's error is a copy, not the gateway's own" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const f = try Fixture.start(a, std.testing.io);
+    defer f.stop();
+
+    const servers = [_]config.ServerConfig{.{
+        .id = "s1",
+        .name = "Broken",
+        .alias = "broken",
+        .transport = .stdio,
+        .enabled = true,
+        .command = "nanomcp-no-such-command-here",
+    }};
+    f.cfg.servers = &servers;
+    try std.testing.expectError(error.ConnectFailed, f.g.sync());
+
+    const views = try gateway_views.servers(&f.g, a);
+    try std.testing.expectEqualStrings("SpawnFailed", views[0].err);
+
+    // The view must not name the gateway's own copy: a sync on another thread
+    // frees and replaces that while a frame is still drawing the view.
+    const stored = f.g.errs.get("s1").?;
+    try std.testing.expect(views[0].err.ptr != stored.ptr);
+}
+
 test "a subprocess upstream is connected over its standard streams" {
     var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena_state.deinit();

@@ -152,7 +152,7 @@ test "the views say where each tool came from and which server is ready" {
     try std.testing.expectEqual(@as(usize, 0), views[1].tools);
 
     // And one server can be looked up on its own.
-    const one = try gateway_views.serverOf(&f.g, "s2");
+    const one = try gateway_views.serverOf(&f.g, a, "s2");
     try std.testing.expectEqualStrings("Search", one.?.config.name);
 }
 

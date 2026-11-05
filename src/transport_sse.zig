@@ -4,7 +4,6 @@
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
-const rpc = @import("rpc.zig");
 const json = @import("json_util.zig");
 const session = @import("session.zig");
 const web = @import("http_client.zig");
@@ -143,7 +142,9 @@ pub const Sse = struct {
             break :blk s.client.send(.POST, endpoint, wired, bytes) catch
                 return error.WriteFailed;
         };
-        defer a.free(answer.body);
+        // The client allocated the body; it is the client's allocator that
+        // frees it, not whichever one the caller handed `send`.
+        defer s.a.free(answer.body);
         if (answer.status == 401) return error.AuthRequired;
         // The answer itself arrives on the stream, so the reply to a post only
         // says that it was taken.
@@ -218,13 +219,7 @@ pub const Sse = struct {
             s.cond.broadcast(s.io);
             return;
         }
-        const arena = session.newArena(s.a) catch return;
-        const message = rpc.Message.parse(arena.allocator(), data);
-        if (s.sess) |sess| {
-            sess.handleMessage(.{ .message = message, .arena = arena });
-        } else {
-            session.freeArena(s.a, arena);
-        }
+        if (s.sess) |sess| sess.handleBytes(data);
     }
 
     fn finish(s: *Sse, reason: []const u8) void {

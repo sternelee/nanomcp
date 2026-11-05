@@ -363,8 +363,7 @@ fn clientConfig(c: *ui.Context, s: *App) []const u8 {
 
 /// Which tools a client sees, by how many servers are connected.
 fn serverLine(c: *ui.Context, s: *App) []const u8 {
-    const views = gateway_views.servers(s.gw, s.gpa) catch return "No server is connected yet, so clients would see only the gateway's own tool.";
-    defer s.gpa.free(views);
+    const views = gateway_views.servers(s.gw, c.arena.allocator()) catch return "No server is connected yet, so clients would see only the gateway's own tool.";
     var ready: usize = 0;
     for (views) |v| {
         if (v.status == .ready) ready += 1;
@@ -376,8 +375,7 @@ fn serverLine(c: *ui.Context, s: *App) []const u8 {
 /// What the gateway has done, newest first.
 fn activity(c: *ui.Context, s: *App, k: theme.Colors) void {
     kit.cardTitle(c, "waveform.path.ecg", "Activity", k.accent);
-    const events = gateway_views.eventsOf(s.gw, s.gpa) catch &.{};
-    defer if (events.len > 0) s.gpa.free(events);
+    const events = gateway_views.eventsOf(s.gw, c.arena.allocator()) catch &.{};
 
     if (events.len == 0) {
         ui.text(c, "Nothing yet.", .{ .size = 12, .color = k.tertiary });

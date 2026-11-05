@@ -3,7 +3,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
-const rpc = @import("rpc.zig");
 const json = @import("json_util.zig");
 const session = @import("session.zig");
 
@@ -130,11 +129,7 @@ pub const Stdio = struct {
             if (!more) break;
             const trimmed = std.mem.trim(u8, line_buf.written(), " \t\r");
             if (trimmed.len == 0) continue;
-            const arena = session.newArena(s.a) catch break;
-            const message = rpc.Message.parse(arena.allocator(), trimmed);
-            if (s.session) |sess| {
-                sess.handleMessage(.{ .message = message, .arena = arena });
-            } else session.freeArena(s.a, arena);
+            if (s.session) |sess| sess.handleBytes(trimmed);
         }
         if (s.session) |sess| sess.markClosed("the server closed its output");
     }

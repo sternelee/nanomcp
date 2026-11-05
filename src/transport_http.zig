@@ -3,7 +3,6 @@
 const std = @import("std");
 const Io = std.Io;
 const http = std.http;
-const rpc = @import("rpc.zig");
 const json = @import("json_util.zig");
 const session = @import("session.zig");
 const web = @import("http_client.zig");
@@ -140,7 +139,7 @@ pub const Http = struct {
                 const maybe_line = stream.next() catch return error.ReadFailed;
                 const line = maybe_line orelse break;
                 const body = eventData(line) orelse continue;
-                t.deliver(a, body) catch return error.OutOfMemory;
+                if (t.sess) |sess| sess.handleBytes(body);
                 if (t.sess) |sess| {
                     if (!sess.awaitsAnswer()) break;
                 }
@@ -149,21 +148,12 @@ pub const Http = struct {
         }
 
         const body = stream.rest() catch return error.ReadFailed;
-        defer a.free(body);
+        // The client allocated the body; it is the client's allocator that
+        // frees it, not whichever one the caller handed `send`.
+        defer t.a.free(body);
         const trimmed = std.mem.trim(u8, body, " \t\r\n");
         if (trimmed.len == 0) return;
-        t.deliver(a, trimmed) catch return error.OutOfMemory;
-    }
-
-    /// Hands one message from the wire to the session.
-    fn deliver(t: *Http, a: std.mem.Allocator, text: []const u8) !void {
-        const arena = try session.newArena(a);
-        const message = rpc.Message.parse(arena.allocator(), text);
-        if (t.sess) |sess| {
-            sess.handleMessage(.{ .message = message, .arena = arena });
-        } else {
-            session.freeArena(a, arena);
-        }
+        if (t.sess) |sess| sess.handleBytes(trimmed);
     }
 
     /// What one request's headers are, and the token among them the caller
@@ -269,4 +259,47 @@ test "a request names the media types the protocol requires" {
     try w.send(w.ctx, a, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}");
     try std.testing.expectEqualStrings("application/json", fixture.content_type[0..fixture.content_len]);
     try std.testing.expectEqualStrings("application/json, text/event-stream", fixture.accept[0..fixture.accept_len]);
+}
+
+test "an answer the session frees is built with the session's allocator" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const server = @import("server.zig");
+
+    // The caller's allocator is a request-scoped arena, as it is when an
+    // external client's tool call reaches the gateway; the session has its own.
+    // The arena an answer is parsed into is freed later by the session, so it
+    // has to come from the session's allocator, not the caller's: freeing it
+    // with the other one is what SafeAllocator reports as "free of invalid
+    // memory".
+    var caller_state: std.heap.ArenaAllocator = .init(gpa);
+    defer caller_state.deinit();
+    const ca = caller_state.allocator();
+
+    const Fixture = struct {
+        fn handle(ctx: *anyopaque, req: *server.Request) anyerror!void {
+            _ = ctx;
+            try req.respond(.{ .content_type = "application/json", .body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}" });
+        }
+    };
+    var fixture: u8 = 0;
+    const listener = try server.Server.initEphemeral(ca, io, .{ .ctx = &fixture, .handle = Fixture.handle });
+    defer {
+        listener.stop();
+        listener.destroy();
+    }
+    try listener.start();
+
+    const url = try std.fmt.allocPrint(ca, "http://127.0.0.1:{d}/mcp", .{listener.port});
+    const t = try Http.init(ca, io, url, &.{});
+    defer t.deinit();
+
+    var session_state: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = session_state.deinit();
+    var sess = session.Session.init(session_state.allocator(), io, t.wire());
+    defer sess.deinit();
+    t.attach(&sess);
+
+    const answer = try sess.call(ca, "tools/list", .{ .object = .empty });
+    try std.testing.expect(answer == .object);
 }

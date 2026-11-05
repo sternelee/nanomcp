@@ -11,26 +11,42 @@ pub const ToolView = gateway_mod.ToolView;
 pub const Event = gateway_mod.Event;
 pub const Status = gateway_mod.Status;
 
-/// The activity entries, oldest first.
+/// The activity entries, oldest first. The text and the server identifier are
+/// copied into `a`: the gateway frees an event's strings when the list is
+/// trimmed, which another thread can do while the frame that draws it is
+/// still running.
 pub fn eventsOf(g: *Gateway, a: std.mem.Allocator) ![]Event {
     g.mu.lockUncancelable(g.io);
     defer g.mu.unlock(g.io);
-    return a.dupe(Event, g.events.items);
+    const out = try a.alloc(Event, g.events.items.len);
+    errdefer a.free(out);
+    for (g.events.items, 0..) |e, i| {
+        out[i] = .{
+            .time = e.time,
+            .server_id = try a.dupe(u8, e.server_id),
+            .text = try a.dupe(u8, e.text),
+            .is_err = e.is_err,
+        };
+    }
+    return out;
 }
 
-/// Every configured server with its live state.
+/// Every configured server with its live state. The error text is copied into
+/// `a`: the gateway replaces it on the next sync, from another thread, while
+/// a frame may still be drawing the one it was handed.
 pub fn servers(g: *Gateway, a: std.mem.Allocator) ![]ServerView {
     g.mu.lockUncancelable(g.io);
     defer g.mu.unlock(g.io);
 
     const views = try a.alloc(ServerView, g.cfg.servers.len);
+    errdefer a.free(views);
     for (g.cfg.servers, 0..) |sc, i| {
         var status: Status = g.status.get(sc.id) orelse .disabled;
         if (!sc.enabled) status = .disabled;
         views[i] = .{
             .config = sc,
             .status = status,
-            .err = g.errs.get(sc.id) orelse "",
+            .err = try a.dupe(u8, g.errs.get(sc.id) orelse ""),
             .tools = g.tools.countFor(sc.id),
             .signed_in = g.signed_in.get(sc.id) orelse false,
         };
@@ -38,10 +54,9 @@ pub fn servers(g: *Gateway, a: std.mem.Allocator) ![]ServerView {
     return views;
 }
 
-/// One server's live state.
-pub fn serverOf(g: *Gateway, id: []const u8) !?ServerView {
-    const views = try servers(g, g.a);
-    defer g.a.free(views);
+/// One server's live state, with its strings copied into `a`.
+pub fn serverOf(g: *Gateway, a: std.mem.Allocator, id: []const u8) !?ServerView {
+    const views = try servers(g, a);
     for (views) |v| {
         if (std.mem.eql(u8, v.config.id, id)) return v;
     }
@@ -139,6 +154,9 @@ test "the activity list keeps what the gateway did" {
     try std.testing.expectEqual(@as(usize, 1), events.len);
     try std.testing.expectEqualStrings("serving on http://127.0.0.1:7331", events[0].text);
     try std.testing.expect(!events[0].is_err);
+    // The text is a copy: trimming the list on another thread frees the
+    // gateway's own, which a frame drawing the event must not be reading.
+    try std.testing.expect(events[0].text.ptr != g.events.items[0].text.ptr);
 
     try std.testing.expectEqualStrings("needs-auth", Status.needs_auth.label());
     try std.testing.expectEqualStrings("error", Status.failed.label());
@@ -175,6 +193,6 @@ test "the meta tool describes the configured servers" {
     const views = try servers(&g, a);
     try std.testing.expectEqual(@as(usize, 1), views.len);
     try std.testing.expectEqual(@as(usize, 0), views[0].tools);
-    const one = try serverOf(&g, "s1");
+    const one = try serverOf(&g, a, "s1");
     try std.testing.expectEqualStrings("Files", one.?.config.name);
 }

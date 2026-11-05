@@ -181,7 +181,7 @@ test "a server that asks for authorization is recognized as needing a sign-in wi
 
     f.g.sync() catch {};
     try std.testing.expectEqual(Status.needs_auth, f.g.statusOf("s1"));
-    const view = (try gateway_views.serverOf(&f.g, "s1")).?;
+    const view = (try gateway_views.serverOf(&f.g, a, "s1")).?;
     try std.testing.expect(!view.signed_in);
     // The interface is told, even though the configuration said nothing.
     const events = try gateway_views.eventsOf(&f.g, a);
@@ -225,7 +225,7 @@ test "signing out forgets the token and the server asks for authorization again"
     try f.g.reconnect("s1");
     try std.testing.expectEqual(Status.ready, f.g.statusOf("s1"));
     try std.testing.expectEqual(@as(usize, 1), f.g.toolCount("s1"));
-    try std.testing.expect((try gateway_views.serverOf(&f.g, "s1")).?.signed_in);
+    try std.testing.expect((try gateway_views.serverOf(&f.g, a, "s1")).?.signed_in);
     try std.testing.expectEqualStrings("Bearer " ++ upstream_token, upstream.sent.items);
     const published = try f.g.tools.list(a);
     try std.testing.expectEqualStrings("protected__echo", published[0].name);
@@ -233,7 +233,7 @@ test "signing out forgets the token and the server asks for authorization again"
     // Signing out forgets the token, and the server goes back to asking.
     try oauth.signOut(&f.g, a, "s1");
     try std.testing.expect(!f.store.signedIn(a, "s1", auth.now(f.io)));
-    try std.testing.expect(!(try gateway_views.serverOf(&f.g, "s1")).?.signed_in);
+    try std.testing.expect(!(try gateway_views.serverOf(&f.g, a, "s1")).?.signed_in);
     try std.testing.expectEqual(Status.needs_auth, f.g.statusOf("s1"));
     try std.testing.expectEqual(@as(usize, 0), f.g.toolCount("s1"));
 }

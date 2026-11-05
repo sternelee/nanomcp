@@ -14,8 +14,7 @@ const views = @import("server_views.zig");
 const App = state_mod.App;
 
 pub fn page(c: *ui.Context, s: *App, k: theme.Colors) void {
-    const list = gateway_views.servers(s.gw, s.gpa) catch &.{};
-    defer s.gpa.free(list);
+    const list = gateway_views.servers(s.gw, c.arena.allocator()) catch &.{};
     const shown = visibleViews(s.gpa, s, list) catch &.{};
     defer if (shown.len > 0) s.gpa.free(shown);
     clampSelection(s, shown.len);

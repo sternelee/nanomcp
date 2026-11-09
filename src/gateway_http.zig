@@ -64,7 +64,7 @@ fn guarded(
     resource_path: []const u8,
     next: *const fn (g: *gateway_mod.Gateway, req: *server.Request) anyerror!void,
 ) !void {
-    const mode = g.cfg.inboundMode();
+    const mode = g.inboundMode();
     if (!mode.requiresToken()) return next(g, req);
 
     const presented = auth.bearerToken(req);
@@ -97,7 +97,7 @@ fn asAuthServer(
     req: *server.Request,
     next: *const fn (g: *gateway_mod.Gateway, req: *server.Request) anyerror!void,
 ) !void {
-    if (g.cfg.inboundMode() != .oauth) {
+    if (g.inboundMode() != .oauth) {
         try req.respond(.{ .status = .not_found, .body = "not found" });
         return;
     }
@@ -113,7 +113,7 @@ fn handleHealth(g: *gateway_mod.Gateway, req: *server.Request) !void {
 /// client used.
 fn handleProtectedResource(g: *gateway_mod.Gateway, req: *server.Request, resource_path: []const u8) !void {
     const base = try gateway_views.baseURL(g, req.a);
-    const oauth_mode = g.cfg.inboundMode() == .oauth;
+    const oauth_mode = g.inboundMode() == .oauth;
     try req.respond(.{ .body = try auth.protectedResourceMetadata(req.a, base, resource_path, oauth_mode) });
 }
 

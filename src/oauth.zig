@@ -98,24 +98,21 @@ pub const Error = error{ NoSuchServer, NotOAuth, NotServing, NoOAuthDetails, Ref
 
 /// Starts an OAuth sign-in for one server. Returns the authorization URL to open.
 pub fn beginAuth(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []const u8) ![]u8 {
-    const sc = g.cfg.server(server_id) orelse return error.NoSuchServer;
+    const sc = g.serverById(server_id) orelse return error.NoSuchServer;
     if (sc.transport == .stdio) return error.NotOAuth;
     const header: []const u8 = sc.token_header orelse "";
     if (header.len > 0) return error.NotOAuth;
     if (!g.serving()) return error.NotServing;
 
     // Try connecting once with OAuth forced; if it connects straight away,
-    // that means the server already has a token.
+    // that means the server already has a token. A failure to connect at all
+    // is reported as a refusal: the server's row is what names the reason.
     const outcome = upstream.connect(a, g.io, sc, .{
         .creds = g.creds,
         .redirect_uri = try gateway_views.redirectURI(g, a),
         .version = g.version,
         .force_oauth = true,
-    }) catch |err| {
-        if (err == error.SignInRequired) {} else return err;
-        // fall through
-        return error.Refused;
-    };
+    }) catch return error.Refused;
 
     switch (outcome) {
         .ready => |up| {
@@ -140,7 +137,7 @@ pub fn beginAuth(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []con
 
 /// Signs out a server: forgets its upstream token and reconnects it.
 pub fn signOut(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []const u8) !void {
-    const sc = g.cfg.server(server_id) orelse return error.NoSuchServer;
+    const sc = g.serverById(server_id) orelse return error.NoSuchServer;
     g.creds.signOut(a, sc.id) catch {};
     g.markSignedIn(sc.id, false);
     g.note(sc.name, "signed out", false);
@@ -151,7 +148,7 @@ pub fn signOut(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []const
 
 /// Sets the client credentials to use for a server's OAuth sign-in.
 pub fn setClientCredentials(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []const u8, client_id: []const u8, secret: []const u8) !void {
-    const sc = g.cfg.server(server_id) orelse return error.NoSuchServer;
+    const sc = g.serverById(server_id) orelse return error.NoSuchServer;
     if (client_id.len == 0) {
         g.creds.saveClient(a, sc.id, .{}) catch {};
         return;
@@ -166,7 +163,7 @@ pub fn setClientCredentials(g: *gateway_mod.Gateway, a: std.mem.Allocator, serve
 
 /// Gets the client credentials stored for a server.
 pub fn clientCredentials(g: *gateway_mod.Gateway, a: std.mem.Allocator, server_id: []const u8) credentials.ClientCredentials {
-    const sc = g.cfg.server(server_id) orelse return .{};
+    const sc = g.serverById(server_id) orelse return .{};
     return g.creds.client(a, sc.id);
 }
 
@@ -311,7 +308,7 @@ pub fn handleCallback(g: *gateway_mod.Gateway, req: *server.Request) !void {
     g.reconnect(pending.server_id) catch |err| {
         // The row holds what the connection actually said; the error name
         // alone would only read ConnectFailed.
-        const kept = g.errorOf(pending.server_id);
+        const kept = try g.errorOf(a, pending.server_id);
         const reason = if (kept.len > 0)
             kept
         else

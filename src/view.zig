@@ -137,7 +137,7 @@ fn collapseButton(c: *ui.Context, s: *App, k: theme.Colors, folded: bool) void {
     defer b.end();
     ui.icon(c, "sidebar.left", .{ .size = 15, .color = k.text.alpha(0.72) });
     if (b.clicked()) {
-        s.cfg.sidebar_collapsed = !folded;
+        s.gw.setSidebar(!folded);
         s.save();
         s.redisplay();
     }

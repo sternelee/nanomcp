@@ -38,6 +38,11 @@ pub const Http = struct {
             .url = try a.dupe(u8, url),
             .headers = try cloneHeaders(a, headers),
         };
+        // A tool call is answered within the session's own timeout, so the
+        // answer's body may take no longer than that: a server that stalls
+        // after its head would otherwise hold every call on this connection
+        // behind the one that is stuck.
+        self.client.body_timeout = .{ .nanoseconds = 30 * std.time.ns_per_s };
         return self;
     }
 
@@ -163,17 +168,27 @@ pub const Http = struct {
         bearer: ?[]u8,
     };
 
-    /// The configured headers plus the ones every request carries.
+    /// The configured headers plus the ones every request carries. The token
+    /// the bearer makes wins over a configured header of its own name: one
+    /// name with two values is not a message any server is promised to read.
     fn headersFor(t: *Http, a: std.mem.Allocator) !Outbound {
         const bearer: ?[]u8 = if (t.bearer) |b| b.header(b.ctx, a) else null;
+        errdefer if (bearer) |value| a.free(value);
 
+        var kept: usize = 0;
+        for (t.headers) |h| {
+            if (bearer == null or !std.ascii.eqlIgnoreCase(h.name, "authorization")) kept += 1;
+        }
         var extra: usize = 0;
         if (t.session_id != null) extra += 1;
         if (bearer != null) extra += 1;
-
-        const out = try a.alloc(web.Header, t.headers.len + extra);
-        for (t.headers, 0..) |h, i| out[i] = h;
-        var next = t.headers.len;
+        const out = try a.alloc(web.Header, kept + extra);
+        var next: usize = 0;
+        for (t.headers) |h| {
+            if (bearer != null and std.ascii.eqlIgnoreCase(h.name, "authorization")) continue;
+            out[next] = h;
+            next += 1;
+        }
         if (bearer) |value| {
             out[next] = .{ .name = "authorization", .value = value };
             next += 1;

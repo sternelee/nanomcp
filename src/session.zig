@@ -26,15 +26,6 @@ pub const Wire = struct {
     close: *const fn (ctx: *anyopaque) void,
 };
 
-/// What a notification from the upstream means to the gateway.
-pub const Listener = struct {
-    ctx: *anyopaque,
-    /// Called on the reader thread; it must hand work to the main thread.
-    onNotification: *const fn (ctx: *anyopaque, method: []const u8, params: json.Value) void,
-    /// Called on the reader thread when the connection ends.
-    onClose: *const fn (ctx: *anyopaque) void,
-};
-
 /// A message that arrived, with the memory it was parsed into. Whoever takes
 /// it over frees the arena.
 pub const Incoming = struct {
@@ -59,7 +50,6 @@ pub const Session = struct {
     a: std.mem.Allocator,
     io: Io,
     wire: Wire,
-    listener: ?Listener = null,
     /// How long a call waits for its answer before failing with TimedOut.
     timeout: Io.Clock.Duration = default_call_timeout,
 
@@ -73,6 +63,9 @@ pub const Session = struct {
     /// Set once the session has been torn down, so closing a connection and
     /// then destroying it does not free the same memory twice.
     dead: bool = false,
+    /// The last thing a refused request said, owned here, so a caller can
+    /// quote the refusal instead of a bare error name.
+    last_error: ?[]const u8 = null,
     /// The last thing the connection said when it failed.
     failure: ?[]const u8 = null,
 
@@ -93,6 +86,7 @@ pub const Session = struct {
         var it = s.pending.valueIterator();
         while (it.next()) |w| freeArena(s.a, w.arena);
         s.pending.deinit(s.a);
+        if (s.last_error) |e| s.a.free(e);
         if (s.failure) |f| s.a.free(f);
         s.mu.unlock(s.io);
     }
@@ -162,6 +156,7 @@ pub const Session = struct {
                 defer freeArena(s.a, kv.value.arena);
                 if (kv.value.response.err) |e| {
                     std.log.debug("upstream refused {d}: {s}", .{ e.code, e.message });
+                    s.rememberError(e.message);
                     return error.ProtocolError;
                 }
                 // The answer lives in the arena, which goes away here, so it is
@@ -208,12 +203,10 @@ pub const Session = struct {
                 }
                 s.cond.broadcast(s.io);
             },
-            .notification => |n| {
-                if (s.listener) |l| {
-                    l.onNotification(l.ctx, n.method, n.params);
-                }
-                freeArena(s.a, incoming.arena);
-            },
+            // Notifications carry nothing the gateway acts on; the answer
+            // they might prompt (a changed tool list) is discovered on the
+            // next sync instead.
+            .notification => freeArena(s.a, incoming.arena),
             else => freeArena(s.a, incoming.arena),
         }
     }
@@ -229,10 +222,25 @@ pub const Session = struct {
         s.handleMessage(.{ .message = message, .arena = arena });
     }
 
+    /// Keeps what the last refused request said; the mutex is held.
+    fn rememberError(s: *Session, message: []const u8) void {
+        const owned = s.a.dupe(u8, message) catch return;
+        if (s.last_error) |old| s.a.free(old);
+        s.last_error = owned;
+    }
+
+    /// What the last refused request said, or null. The borrow is only good
+    /// until the next call on this session: copy it if it has to outlive the
+    /// question.
+    pub fn errorText(s: *Session) ?[]const u8 {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        return s.last_error;
+    }
+
     /// Marks the connection as ended, waking everyone waiting on it.
     pub fn markClosed(s: *Session, reason: ?[]const u8) void {
         s.mu.lockUncancelable(s.io);
-        const already = s.closed;
         s.closed = true;
         if (reason) |r| {
             if (s.failure) |old| s.a.free(old);
@@ -240,9 +248,6 @@ pub const Session = struct {
         }
         s.mu.unlock(s.io);
         s.cond.broadcast(s.io);
-        if (!already) {
-            if (s.listener) |l| l.onClose(l.ctx);
-        }
     }
 
     /// Whether the connection has ended, and why.

@@ -246,6 +246,8 @@ pub const Gateway = struct {
     }
 
     pub fn serverName(g: *Gateway, id: []const u8) []const u8 {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
         if (g.cfg.server(id)) |sc| return sc.name;
         return id;
     }
@@ -253,20 +255,87 @@ pub const Gateway = struct {
     /// The current status of one configured server, or disabled when off.
     pub fn statusFor(g: *Gateway, sc: config.ServerConfig) Status {
         if (!sc.enabled) return .disabled;
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
         return g.status.get(sc.id) orelse .disabled;
     }
 
     /// The current status of one configured server, or disabled when off.
     pub fn statusOf(g: *Gateway, id: []const u8) Status {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
         const sc = for (g.cfg.servers) |s| {
             if (std.mem.eql(u8, s.id, id)) break s;
         } else return .disabled;
-        return g.statusFor(sc);
+        if (!sc.enabled) return .disabled;
+        return g.status.get(sc.id) orelse .disabled;
     }
 
-    /// The last error text kept for a server, empty when there is none.
-    pub fn errorOf(g: *Gateway, id: []const u8) []const u8 {
-        return g.errs.get(id) orelse "";
+    /// The last error text kept for a server, copied into `a`, empty when
+    /// there is none. The copy is what keeps the answer alive: the gateway
+    /// replaces the stored text from another thread, freeing the one a frame
+    /// may still be drawing.
+    pub fn errorOf(g: *Gateway, a: std.mem.Allocator, id: []const u8) ![]const u8 {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        return a.dupe(u8, g.errs.get(id) orelse "");
+    }
+
+    /// One configured server, copied. Safe from any thread: the window edits
+    /// the configuration on its own, without knowing who is reading.
+    pub fn serverById(g: *Gateway, id: []const u8) ?config.ServerConfig {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        return g.cfg.server(id);
+    }
+
+    /// How callers of the gateway prove who they are, as configured.
+    pub fn inboundMode(g: *Gateway) config.InboundMode {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        return g.cfg.inboundMode();
+    }
+
+    /// Adds or replaces a server and keeps the aliases unique. The lock is
+    /// what makes the edit safe against a sync that is reading the
+    /// configuration on its own thread.
+    pub fn saveServer(g: *Gateway, a: std.mem.Allocator, entry: config.ServerConfig) !void {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        try g.cfg.upsert(a, entry);
+        _ = try g.cfg.ensureAliases(a);
+    }
+
+    /// Deletes a server from the configuration.
+    pub fn dropServer(g: *Gateway, a: std.mem.Allocator, id: []const u8) !bool {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        return g.cfg.remove(a, id);
+    }
+
+    /// Merges imported servers into the configuration.
+    pub fn importInto(g: *Gateway, a: std.mem.Allocator, incoming: []config.ServerConfig) !@import("import.zig").ImportResult {
+        g.mu.lockUncancelable(g.io);
+        defer g.mu.unlock(g.io);
+        return @import("import.zig").importServers(a, g.io, g.cfg, incoming);
+    }
+
+    pub fn setPort(g: *Gateway, port: i32) void {
+        g.mu.lockUncancelable(g.io);
+        g.cfg.port = port;
+        g.mu.unlock(g.io);
+    }
+
+    pub fn setInbound(g: *Gateway, mode: config.InboundMode) void {
+        g.mu.lockUncancelable(g.io);
+        g.cfg.inbound = mode;
+        g.mu.unlock(g.io);
+    }
+
+    pub fn setSidebar(g: *Gateway, collapsed: bool) void {
+        g.mu.lockUncancelable(g.io);
+        g.cfg.sidebar_collapsed = collapsed;
+        g.mu.unlock(g.io);
     }
 
     /// Records why a server could not connect or sign in, for its row.
@@ -284,8 +353,10 @@ pub const Gateway = struct {
 
     /// Invokes an aggregated tool by its namespaced name. A tool that fails at
     /// its upstream is an error here, which the endpoint reports as a tool
-    /// error so the calling model sees it and can react.
-    pub fn callTool(g: *Gateway, a: std.mem.Allocator, name: []const u8, args: ?json.Value) !json.Value {
+    /// error so the calling model sees it and can react. `detail`, when
+    /// given, receives what the upstream said: it is only set on
+    /// `error.ProtocolError`.
+    pub fn callTool(g: *Gateway, a: std.mem.Allocator, name: []const u8, args: ?json.Value, detail: ?*?[]const u8) !json.Value {
         // Copied, because a sync on another thread may drop this tool from
         // the registry while the call is under way.
         const entry = (try g.tools.findCopy(a, name)) orelse return error.UnknownTool;
@@ -295,7 +366,16 @@ pub const Gateway = struct {
         // disconnected while the call is waiting for its answer.
         const up = g.acquireUpstream(entry.server_id) orelse return error.NotConnected;
         defer g.releaseUpstream(up);
-        return up.callTool(a, entry.upstream_name, args);
+        return up.callTool(a, entry.upstream_name, args) catch |err| {
+            // A refusal from the upstream says why; pass it on so the caller
+            // can show the reason rather than a bare error name.
+            if (err == error.ProtocolError) {
+                if (up.sess.errorText()) |message| {
+                    if (detail) |d| d.* = try std.fmt.allocPrint(a, "{s}: {s}", .{ g.serverName(entry.server_id), message });
+                }
+            }
+            return err;
+        };
     }
 
     /// Takes a reference to a connected upstream. The caller releases it.
@@ -344,7 +424,18 @@ pub const Gateway = struct {
     /// callers of the gateway must present.
     pub fn refreshCredentials(g: *Gateway) void {
         const a = g.a;
-        for (g.cfg.servers) |sc| {
+        // A copy of the server list: the window edits the configuration on
+        // its own thread, and this runs on the sync worker's.
+        g.mu.lockUncancelable(g.io);
+        const configured = g.a.dupe(config.ServerConfig, g.cfg.servers) catch {
+            g.mu.unlock(g.io);
+            return;
+        };
+        const needs = g.cfg.inboundMode().requiresToken();
+        g.mu.unlock(g.io);
+        defer g.a.free(configured);
+
+        for (configured) |sc| {
             // A remote server with no token of its own is one that signs in.
             if (sc.transport != .stdio and headerText(sc.token_header).len == 0) {
                 const signed = g.creds.signedIn(a, sc.id, auth.now(g.io));
@@ -353,8 +444,6 @@ pub const Gateway = struct {
                 g.mu.unlock(g.io);
             }
         }
-
-        const needs = g.cfg.inboundMode().requiresToken();
         var token: ?[]u8 = null;
         var unreadable = false;
         if (needs) {
@@ -409,10 +498,18 @@ pub const Gateway = struct {
         defer todo.deinit(g.a);
 
         g.mu.lockUncancelable(g.io);
+        // The list of servers, copied while the lock is held: the window
+        // edits the configuration on its own thread, and the checks below
+        // read it on this one.
+        const configured = g.a.dupe(config.ServerConfig, g.cfg.servers) catch {
+            g.mu.unlock(g.io);
+            return;
+        };
+        defer g.a.free(configured);
         {
             var it = g.upstreams.iterator();
             while (it.next()) |kv| {
-                const sc = g.cfg.server(kv.key_ptr.*) orelse {
+                const sc = config.ServerConfig.byId(configured, kv.key_ptr.*) orelse {
                     stale.append(g.a, kv.value_ptr.*) catch {};
                     continue;
                 };
@@ -423,7 +520,7 @@ pub const Gateway = struct {
                 g.forgetStatus(up.config.id);
                 g.tools.removeServer(up.config.id);
             }
-            for (g.cfg.servers) |sc| {
+            for (configured) |sc| {
                 if (!sc.enabled) {
                     g.setStatusLocked(sc.id, .disabled, "");
                     continue;
@@ -466,7 +563,7 @@ pub const Gateway = struct {
         const had_connection = g.upstreams.get(id) != null;
         g.forgetStatus(id);
         g.tools.removeServer(id);
-        const sc = g.cfg.server(id);
+        const sc = config.ServerConfig.byId(g.cfg.servers, id);
         g.mu.unlock(g.io);
         if (had_connection) @import("mcp_endpoint.zig").notifyToolsChanged(g);
 

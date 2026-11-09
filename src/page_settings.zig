@@ -85,7 +85,7 @@ fn setPort(s: *App) void {
         s.notify("Choose a port between 1 and 65535", true);
         return;
     }
-    s.cfg.port = @intCast(port);
+    s.gw.setPort(@intCast(port));
     s.save();
     if (s.gw.serving()) {
         restartGateway(s, @intCast(port));
@@ -102,7 +102,7 @@ fn startGateway(s: *App) void {
         s.notify("Choose a port between 1 and 65535", true);
         return;
     }
-    s.cfg.port = @intCast(port);
+    s.gw.setPort(@intCast(port));
     s.save();
     s.settings.busy = "Starting the gateway…";
     s.gw.startAsync(@intCast(port)) catch |e| {
@@ -210,7 +210,7 @@ fn setAuthMode(s: *App, mode: config.InboundMode) void {
         };
         s.reloadInboundToken();
     }
-    s.cfg.inbound = mode;
+    s.gw.setInbound(mode);
     s.save();
     s.gw.refreshCredentials();
     var buf: [64]u8 = undefined;

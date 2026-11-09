@@ -218,6 +218,7 @@ pub const Upstream = struct {
     /// Calls one of the server's tools by the name it knows.
     pub fn callTool(u: *Upstream, a: std.mem.Allocator, name: []const u8, args: ?json.Value) !json.Value {
         var params: json.Object = .empty;
+        defer params.deinit(a);
         try params.put(a, "name", .{ .string = name });
         try params.put(a, "arguments", args orelse .{ .object = .empty });
         return u.sess.call(a, "tools/call", .{ .object = params });
@@ -359,23 +360,27 @@ fn startLink(a: std.mem.Allocator, io: Io, sc: config.ServerConfig, opts: Option
 }
 
 /// The headers every request to a remote server carries: the configured ones,
-/// plus the stored token when the server takes one.
+/// plus the stored token when the server takes one. The token wins over a
+/// configured header of the same name, whatever its case: two values for one
+/// name is not a message any server is promised to read.
 pub fn requestHeaders(a: std.mem.Allocator, sc: config.ServerConfig, opts: Options) ![]web.Header {
     var out: std.ArrayList(web.Header) = .empty;
     errdefer out.deinit(a);
+    const token_name: ?[]const u8 = if (sc.token_header != null and sc.token_header.?.len > 0) sc.token_header else null;
     if (sc.headers) |headers| {
         for (headers.map.keys(), headers.map.values()) |name, value| {
+            if (token_name) |token| {
+                if (std.ascii.eqlIgnoreCase(name, token)) continue;
+            }
             try out.append(a, .{ .name = name, .value = value });
         }
     }
-    if (sc.token_header) |header| {
-        if (header.len > 0) {
-            if (opts.creds) |creds| {
-                const token = creds.upstreamToken(a, sc.id);
-                defer a.free(token);
-                if (token.len > 0) {
-                    try out.append(a, .{ .name = header, .value = try tokenValue(a, sc.token_scheme, token) });
-                }
+    if (token_name) |header| {
+        if (opts.creds) |creds| {
+            const token = creds.upstreamToken(a, sc.id);
+            defer a.free(token);
+            if (token.len > 0) {
+                try out.append(a, .{ .name = header, .value = try tokenValue(a, sc.token_scheme, token) });
             }
         }
     }
@@ -405,9 +410,11 @@ pub fn oauthFor(a: std.mem.Allocator, sc: config.ServerConfig, opts: Options) bo
 fn handshake(u: *Upstream, version: []const u8) !void {
     const a = u.a;
     var params: json.Object = .empty;
+    defer params.deinit(a);
     try params.put(a, "protocolVersion", .{ .string = protocol_version });
     try params.put(a, "capabilities", .{ .object = .empty });
     var info: json.Object = .empty;
+    defer info.deinit(a);
     try info.put(a, "name", .{ .string = "nanomcp" });
     try info.put(a, "version", .{ .string = version });
     try params.put(a, "clientInfo", .{ .object = info });
@@ -425,6 +432,7 @@ fn listTools(u: *Upstream) ![]json.Value {
     var rounds: usize = 0;
     while (rounds < 64) : (rounds += 1) {
         var params: json.Object = .empty;
+        defer params.deinit(a);
         if (cursor) |c| try params.put(a, "cursor", .{ .string = c });
         const result = try u.sess.call(a, "tools/list", .{ .object = params });
         if (json.getArray(result, "tools")) |tools| {
@@ -533,4 +541,22 @@ test "configured headers and the stored token both go on the request" {
     }
     try std.testing.expect(saw_version);
     try std.testing.expect(saw_auth);
+
+    // A configured header the token also sets is replaced, not duplicated:
+    // one name with two values is not a message any server is promised to
+    // read.
+    var conflicting: std.json.ArrayHashMap([]const u8) = .{};
+    try conflicting.map.put(a, "x-api-key", "stale");
+    const keyed: config.ServerConfig = .{
+        .id = "s1",
+        .name = "GitHub",
+        .transport = .http,
+        .url = "https://example.com/mcp",
+        .headers = conflicting,
+        .token_header = "X-API-Key",
+    };
+    const merged = try requestHeaders(a, keyed, .{ .creds = &store });
+    try std.testing.expectEqual(@as(usize, 1), merged.len);
+    try std.testing.expectEqualStrings("X-API-Key", merged[0].name);
+    try std.testing.expectEqualStrings("ghp_secret", merged[0].value);
 }

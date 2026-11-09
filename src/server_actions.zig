@@ -58,8 +58,7 @@ pub fn saveForm(s: *App, target: config.ServerConfig) void {
         return;
     }
     s.servers.form_error = "";
-    s.cfg.upsert(s.cfgAlloc(), edited) catch return;
-    _ = s.cfg.ensureAliases(s.cfgAlloc()) catch false;
+    s.gw.saveServer(s.cfgAlloc(), edited) catch return;
     s.save();
 
     if (edited.oauth) {
@@ -138,28 +137,93 @@ pub fn reconnect(s: *App, id: []const u8) void {
 }
 
 /// Starts an OAuth sign-in and opens the browser at the authorization URL.
+/// The probe connect and the discovery run on their own thread: a server
+/// that never answers must not freeze the window while it is probed.
 pub fn signIn(s: *App, id: []const u8) void {
     if (s.window == null) return;
-    const url = oauth.beginAuth(s.gw, s.gpa, id) catch |err| {
-        const text = switch (err) {
-            error.NoSuchServer => "that server is gone",
-            error.NotOAuth => "this server does not sign in with OAuth",
-            error.NotServing => "start the gateway first, so that your browser can come back to it",
-            error.NoOAuthDetails => "the server requires authorization but sent no OAuth details",
-            // A refused sign-in leaves the reason on the server's row; say it
-            // rather than the generic sentence.
-            else => if (s.gw.errorOf(id).len > 0) s.gw.errorOf(id) else "the sign-in could not be started",
-        };
-        s.notify(text, true);
+    const owned = s.gpa.dupe(u8, id) catch return;
+    const thread = std.Thread.spawn(.{}, signInWorker, .{ s, owned }) catch {
+        s.gpa.free(owned);
+        s.notify("the sign-in could not be started", true);
         return;
     };
-    defer s.gpa.free(url);
-    if (url.len == 0) {
-        s.notify("Already signed in", false);
+    thread.detach();
+}
+
+/// What the sign-in thread hands back to the window: the address to open,
+/// or the reason it could not be started.
+const SignInBox = struct {
+    s: *App,
+    id: []u8,
+    url: ?[]u8,
+    text: []const u8,
+};
+
+/// Why a sign-in refused, in the gateway's own words when it has them.
+fn signInErrorText(s: *App, id: []const u8) []const u8 {
+    const generic = "the sign-in could not be started";
+    const kept = s.gw.errorOf(s.gpa, id) catch return s.gpa.dupe(u8, generic) catch "";
+    defer s.gpa.free(kept);
+    if (kept.len == 0) return s.gpa.dupe(u8, generic) catch "";
+    return s.gpa.dupe(u8, kept) catch "";
+}
+
+fn signInWorker(s: *App, id: []u8) void {
+    const url = oauth.beginAuth(s.gw, s.gpa, id) catch |err| {
+        const text: []const u8 = switch (err) {
+            error.NoSuchServer => s.gpa.dupe(u8, "that server is gone") catch "",
+            error.NotOAuth => s.gpa.dupe(u8, "this server does not sign in with OAuth") catch "",
+            error.NotServing => s.gpa.dupe(u8, "start the gateway first, so that your browser can come back to it") catch "",
+            error.NoOAuthDetails => s.gpa.dupe(u8, "the server requires authorization but sent no OAuth details") catch "",
+            // A refused sign-in leaves the reason on the server's row; say it
+            // rather than the generic sentence. `notify` copies the text it
+            // is given, so borrowing the row's text here is safe.
+            else => signInErrorText(s, id),
+        };
+        finishSignIn(.{ .s = s, .id = id, .url = null, .text = text });
         return;
+    };
+    finishSignIn(.{ .s = s, .id = id, .url = url, .text = "" });
+}
+
+/// Opens the browser, or names the refusal, on the thread the window lives
+/// on: both the toast and `openUrl` belong to the main thread.
+fn finishSignIn(box: SignInBox) void {
+    if (@import("builtin").os.tag == .macos) {
+        const heap = box.s.gpa.create(SignInBox) catch {
+            box.s.gpa.free(box.id);
+            if (box.url) |u| box.s.gpa.free(u);
+            return;
+        };
+        heap.* = box;
+        nanoui.objc.dispatchMain(heap, deliverSignIn);
+    } else {
+        deliverSignInBody(box);
     }
-    _ = nanoui.shell.openUrl(url);
-    s.notify("Finish signing in in your browser", false);
+}
+
+fn deliverSignIn(ctx: ?*anyopaque) callconv(.c) void {
+    const heap: *SignInBox = @ptrCast(@alignCast(ctx.?));
+    const box = heap.*;
+    heap.s.gpa.destroy(heap);
+    deliverSignInBody(box);
+}
+
+fn deliverSignInBody(box: SignInBox) void {
+    const s = box.s;
+    s.gpa.free(box.id);
+    if (box.url) |u| {
+        defer s.gpa.free(u);
+        if (u.len == 0) {
+            s.notify("Already signed in", false);
+        } else {
+            _ = nanoui.shell.openUrl(u);
+            s.notify("Finish signing in in your browser", false);
+        }
+    } else {
+        defer if (box.text.len > 0) s.gpa.free(box.text);
+        s.notify(if (box.text.len > 0) box.text else "the sign-in could not be started", true);
+    }
 }
 
 /// Forgets a server's OAuth token, so the next connection asks to sign in
@@ -190,7 +254,7 @@ pub fn removeServer(s: *App, id: []const u8) void {
         return;
     };
     const enabled = sc.enabled;
-    _ = s.cfg.remove(s.cfgAlloc(), id) catch false;
+    _ = s.gw.dropServer(s.cfgAlloc(), id) catch false;
     s.save();
     s.creds.signOut(s.gpa, id) catch {};
     s.creds.setUpstreamToken(s.gpa, id, "") catch {};
@@ -226,7 +290,7 @@ pub fn doImport(s: *App) void {
             s.servers.import_error = message;
         },
         .servers => |servers| {
-            const result = import_mod.importServers(s.cfgAlloc(), s.io, &s.cfg, servers) catch {
+            const result = s.gw.importInto(s.cfgAlloc(), servers) catch {
                 s.servers.import_error = "The import could not be saved.";
                 return;
             };

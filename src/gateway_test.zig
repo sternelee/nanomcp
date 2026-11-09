@@ -554,7 +554,8 @@ test "a tool whose upstream fails is a tool error, not a protocol error" {
     const answer = try callTool(f, a, "filesystem__boom", null);
     try std.testing.expect(answer.err == null);
     try std.testing.expect(json.getBool(answer.result, "isError").?);
-    try std.testing.expectEqualStrings("the tool failed", resultText(answer.result));
+    // ...and the reason the upstream gave is what the caller sees.
+    try std.testing.expectEqualStrings("Filesystem: upstream exploded", resultText(answer.result));
 
     // ...and the gateway itself is unharmed: the other tool still answers.
     try std.testing.expect(hasTool(try listedTools(f, a), "filesystem__echo"));

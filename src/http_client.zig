@@ -41,17 +41,17 @@ pub const Answer = struct {
 /// A watchdog that shuts a connection down when a request has taken too long.
 /// `std.http` has no timeout of its own, and a server that accepts a request
 /// and never answers would otherwise hold the caller for ever.
-const Deadline = struct {
+pub const Deadline = struct {
     io: Io = undefined,
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
     done: bool = false,
     fired: bool = false,
-    stream: ?*Io.net.Stream = null,
+    stream: ?*const Io.net.Stream = null,
     duration: Io.Duration = .{ .nanoseconds = 0 },
     thread: ?std.Thread = null,
 
-    fn arm(d: *Deadline, io: Io, stream: ?*Io.net.Stream, duration: Io.Duration) void {
+    pub fn arm(d: *Deadline, io: Io, stream: ?*const Io.net.Stream, duration: Io.Duration) void {
         if (stream == null or duration.nanoseconds <= 0) return;
         d.io = io;
         d.stream = stream;
@@ -81,7 +81,7 @@ const Deadline = struct {
 
     /// Stops the watchdog; true when it fired and the connection was shut
     /// down, so the caller can report a timeout rather than a read failure.
-    fn finish(d: *Deadline) bool {
+    pub fn finish(d: *Deadline) bool {
         const thread = d.thread orelse return false;
         d.mu.lockUncancelable(d.io);
         d.done = true;
@@ -101,6 +101,13 @@ pub const Client = struct {
     /// How long a request may take, from connecting to the last body byte,
     /// before its connection is shut down. Zero disables it.
     timeout: Io.Duration = .{ .nanoseconds = 30 * std.time.ns_per_s },
+    /// How long the body of a streaming answer may take in total, from the
+    /// response head to the last byte, before its connection is shut down.
+    /// A request that answers with an event stream is expected to close on
+    /// its own, so this stays off for those; a tool call's answer is expected
+    /// within the call's own timeout, so a transport that cannot hang for
+    /// longer than the call it serves sets one. Zero disables it.
+    body_timeout: Io.Duration = .{ .nanoseconds = 0 },
 
     pub fn init(a: std.mem.Allocator, io: Io) Client {
         return .{ .a = a, .io = io, .inner = .{ .allocator = a, .io = io } };
@@ -276,6 +283,13 @@ pub const Client = struct {
         // it is read as events or JSON.
         s.decompress_buffer = try decompressBuffer(c.a, response.head.content_encoding);
         s.body = response.readerDecompressing(&s.transfer, &s.decompress, s.decompress_buffer);
+        // A server may take the answer hostage after its head is out: stall
+        // the body and a read here would wait for bytes that never come.
+        // The watchdog bounds the whole body, so a call can never outwait
+        // the timeout its caller is already counting down.
+        if (c.body_timeout.nanoseconds > 0) {
+            if (s.req.connection) |conn| s.watchdog.arm(c.io, &conn.stream_reader.stream, c.body_timeout);
+        }
         return s;
     }
 };
@@ -297,6 +311,7 @@ fn openResponse(req: *http.Client.Request, payload: ?[]const u8) !http.Client.Re
 
 /// Frees a stream that never made it out of `Client.stream`.
 fn discardStream(c: *Client, s: *Stream) void {
+    _ = s.watchdog.finish();
     s.req.deinit();
     if (s.content_type) |ct| c.a.free(ct);
     if (s.session_id) |id| c.a.free(id);
@@ -330,6 +345,8 @@ pub const Stream = struct {
     /// live as long as the body is read.
     decompress: http.Decompress = undefined,
     decompress_buffer: []u8 = &.{},
+    /// Bounds the body read when the client asked for a body timeout.
+    watchdog: Deadline = .{},
     a: std.mem.Allocator,
     /// The bytes of the lines gathered so far; one event can be far longer
     /// than the reader's window (a tool list arrives as one huge line).
@@ -343,10 +360,23 @@ pub const Stream = struct {
         return s.status >= 200 and s.status < 300;
     }
 
+    /// Cuts the connection a blocked read is waiting on, so a reader thread
+    /// ends now instead of waiting for bytes that are not coming. The stream
+    /// itself stays valid; it is the caller's job to have exclusive access.
+    pub fn interrupt(s: *Stream, io: Io) void {
+        if (s.req.connection) |conn| conn.stream_reader.stream.shutdown(io, .both) catch {};
+    }
+
     /// Drops the stream. A stream that carries events never ends on its own,
     /// so this closes the connection rather than reading the rest of a body
     /// that would never arrive.
     pub fn close(s: *Stream) void {
+        // The watchdog's thread is joined before the request it watches is
+        // torn down, and a fired watchdog marks the connection unusable so
+        // the pool does not hand out a shut socket.
+        if (s.watchdog.finish()) {
+            if (s.req.connection) |conn| conn.closing = true;
+        }
         s.req.deinit();
         if (s.content_type) |ct| s.a.free(ct);
         if (s.session_id) |id| s.a.free(id);

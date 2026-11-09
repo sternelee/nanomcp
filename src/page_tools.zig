@@ -329,8 +329,9 @@ fn callThread(s: *App, name: []const u8, args_text: []const u8) void {
         announce(s, a.dupe(u8, "Arguments are not valid JSON") catch "", true);
         return;
     };
-    const answer = s.gw.callTool(arena, name, args) catch |e| {
-        announce(s, a.dupe(u8, @errorName(e)) catch "", true);
+    var why: ?[]const u8 = null;
+    const answer = s.gw.callTool(arena, name, args, &why) catch |e| {
+        announce(s, a.dupe(u8, why orelse @errorName(e)) catch "", true);
         return;
     };
     const shown = format(a, answer) catch {

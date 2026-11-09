@@ -84,8 +84,17 @@ pub fn toolViews(g: *Gateway, a: std.mem.Allocator) ![]ToolView {
 /// Where the gateway serves, or the configured port's URL when it is not.
 pub fn baseURL(g: *Gateway, a: std.mem.Allocator) ![]u8 {
     const live = g.servingPort();
-    const port = if (live != 0) live else g.cfg.port;
+    const port = if (live != 0) live else cfgPort(g);
     return std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{port});
+}
+
+/// The port the configuration names, read under the gateway's lock: the
+/// settings page writes it on the window's thread, and this is read from
+/// request handlers.
+fn cfgPort(g: *Gateway) i32 {
+    g.mu.lockUncancelable(g.io);
+    defer g.mu.unlock(g.io);
+    return g.cfg.port;
 }
 
 /// Where an authorization server sends the browser back.

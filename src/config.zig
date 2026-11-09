@@ -156,6 +156,12 @@ pub const ServerConfig = struct {
     token_header: ?[]const u8 = null,
     token_scheme: ?[]const u8 = null,
 
+    /// The server with id in list, or null.
+    pub fn byId(list: []const ServerConfig, id: []const u8) ?ServerConfig {
+        for (list) |s| if (std.mem.eql(u8, s.id, id)) return s;
+        return null;
+    }
+
     /// Reports why the server cannot be connected, or null.
     pub fn validate(s: ServerConfig) ValidateError!void {
         if (std.mem.eql(u8, std.mem.trim(u8, s.name, " \t\r\n"), "")) return error.NameRequired;
@@ -276,8 +282,7 @@ pub const Config = struct {
 
     /// The server with id, or null.
     pub fn server(c: Config, id: []const u8) ?ServerConfig {
-        for (c.servers) |s| if (std.mem.eql(u8, s.id, id)) return s;
-        return null;
+        return ServerConfig.byId(c.servers, id);
     }
 
     /// Adds sc, or replaces the server that shares its ID. Strings must
@@ -432,8 +437,39 @@ pub fn load(a: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         .sidebar_collapsed = wire.sidebarCollapsed,
     };
     if (cfg.port == 0) cfg.port = default_port;
+    // The file can be edited by hand; an id that is not a plain identifier
+    // would leak into the names of the credential files, where a separator
+    // or a dot-dot could steer a path outside the credentials directory.
+    // Servers with such an id are dropped rather than trusted.
+    cfg.servers = try keepSafeIds(a, cfg.servers);
     _ = try cfg.ensureAliases(a);
     return cfg;
+}
+
+/// The servers whose ids name files safely.
+fn keepSafeIds(a: std.mem.Allocator, servers: []const ServerConfig) ![]const ServerConfig {
+    var out: std.ArrayList(ServerConfig) = .empty;
+    errdefer out.deinit(a);
+    for (servers) |sc| {
+        if (validId(sc.id)) try out.append(a, sc);
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// Whether an id is safe to embed in a credential file's name. The app
+/// generates ids of 16 lowercase hex characters; a hand-edited file may
+/// carry anything, and an id with a path separator or a dot-dot could
+/// steer the credential path outside its directory, so those are refused.
+pub fn validId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (std.mem.indexOf(u8, id, "..") != null) return false;
+    for (id) |c| {
+        switch (c) {
+            '/', '\\', ':' => return false,
+            else => {},
+        }
+    }
+    return true;
 }
 
 /// Writes the configuration, replacing the previous one atomically.

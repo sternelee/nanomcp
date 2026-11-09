@@ -34,6 +34,11 @@ pub const Sse = struct {
     sess: ?*session.Session = null,
     thread: ?std.Thread = null,
     dead: bool = false,
+    /// The stream the reader thread is blocked reading, so that closing can
+    /// cut it down and the join below ends instead of waiting for a server
+    /// that keeps its stream open. Guarded by `mu`; set once the stream is
+    /// open, cleared just before the stream is closed.
+    open: ?*web.Stream = null,
 
     mu: Io.Mutex = .init,
     cond: Io.Condition = .init,
@@ -78,6 +83,15 @@ pub const Sse = struct {
     pub fn close(s: *Sse) void {
         s.mu.lockUncancelable(s.io);
         s.dead = true;
+        // The reader thread blocks on a read of the event stream, which a
+        // server may keep open for as long as it lives: the connection is
+        // cut first, so the read fails and the thread ends, and the join
+        // below returns. A null stream means the thread is already on its
+        // way out (or never started), and there is nothing to cut. The cut
+        // happens under the lock: the reader clears `open` and closes the
+        // stream under the same lock, so interrupting inside the lock is
+        // what keeps it from reaching a freed stream.
+        if (s.open) |stream| stream.interrupt(s.io);
         s.mu.unlock(s.io);
         s.cond.broadcast(s.io);
         if (s.thread) |t| t.join();
@@ -105,17 +119,27 @@ pub const Sse = struct {
         bearer: ?[]u8,
     };
 
-    /// The headers every request and the stream itself carry.
+    /// The headers every request and the stream itself carry. The token the
+    /// bearer makes wins over a configured header of its own name: one name
+    /// with two values is not a message any server is promised to read.
     fn headersFor(s: *Sse, a: std.mem.Allocator) !Outbound {
         const bearer: ?[]u8 = if (s.bearer) |b| b.header(b.ctx, a) else null;
         errdefer if (bearer) |value| a.free(value);
 
-        const extra: usize = if (bearer == null) 0 else 1;
-        const out = try a.alloc(web.Header, s.headers.len + extra);
-        for (s.headers, 0..) |h, i| out[i] = h;
+        var kept: usize = 0;
+        for (s.headers) |h| {
+            if (bearer == null or !std.ascii.eqlIgnoreCase(h.name, "authorization")) kept += 1;
+        }
+        const out = try a.alloc(web.Header, kept + @intFromBool(bearer != null));
+        var next: usize = 0;
+        for (s.headers) |h| {
+            if (bearer != null and std.ascii.eqlIgnoreCase(h.name, "authorization")) continue;
+            out[next] = h;
+            next += 1;
+        }
         // The token the bearer made lives until the request is on its way out;
         // freeing it here would leave the header naming freed bytes.
-        if (bearer) |value| out[s.headers.len] = .{ .name = "authorization", .value = value };
+        if (bearer) |value| out[next] = .{ .name = "authorization", .value = value };
         return .{ .list = out, .bearer = bearer };
     }
 
@@ -166,7 +190,20 @@ pub const Sse = struct {
             s.finish("could not open the event stream");
             return;
         };
-        defer stream.close();
+        s.mu.lockUncancelable(s.io);
+        s.open = stream;
+        s.mu.unlock(s.io);
+        // The stream is closed here, at the end, rather than by a defer, so
+        // that `close` above can interrupt it while this thread is blocked
+        // on a read: a defer would free the stream the interrupt is aimed
+        // at. Clearing `open` under the mutex first is what tells `close`
+        // the stream is going away.
+        defer {
+            s.mu.lockUncancelable(s.io);
+            s.open = null;
+            s.mu.unlock(s.io);
+            stream.close();
+        }
         if (stream.status == 401) {
             s.mu.lockUncancelable(s.io);
             if (stream.challenge) |c| s.challenge = s.a.dupe(u8, c) catch null;

@@ -123,6 +123,11 @@ pub const Handler = struct {
 /// registration, never a file.
 pub const max_body = 4 << 20;
 
+/// How long a client may take to say what it wants. A connection that says
+/// nothing is shut down rather than held for ever, which also bounds an idle
+/// keep-alive connection.
+pub const header_timeout: Io.Duration = .{ .nanoseconds = 15 * std.time.ns_per_s };
+
 /// The server itself: a listening socket and the thread that accepts on it.
 pub const Server = struct {
     a: std.mem.Allocator,
@@ -256,7 +261,17 @@ pub const Server = struct {
             defer arena_state.deinit();
             const a = arena_state.allocator();
 
-            var raw = http_server.receiveHead() catch return;
+            // A client that connects and never speaks holds this thread for
+            // as long as its silence lasts, unless the wait for its head is
+            // bounded: the watchdog shuts the connection down when the time
+            // is up, and the read below fails out of the loop.
+            var watchdog: web.Deadline = .{};
+            watchdog.arm(s.io, &stream, header_timeout);
+            var raw = http_server.receiveHead() catch {
+                _ = watchdog.finish();
+                return;
+            };
+            _ = watchdog.finish();
             // The head is copied before the body is started: starting it
             // invalidates the strings the head points at.
             const head_headers = readHeaders(a, &raw) catch return;

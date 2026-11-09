@@ -157,7 +157,7 @@ test "a callback that carries an error says what happened and keeps no token" {
 
     // The row says why the browser came back empty-handed, and the sign-in is
     // gone rather than left waiting.
-    try std.testing.expectEqualStrings("sign-in failed: access_denied: The user said no", f.g.errorOf("s1"));
+    try std.testing.expectEqualStrings("sign-in failed: access_denied: The user said no", try f.g.errorOf(a, "s1"));
     try std.testing.expect(f.g.pending.take(a, state) == null);
 }
 

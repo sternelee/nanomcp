@@ -199,11 +199,16 @@ pub const App = struct {
         if (s.inbound_token) |token| s.gpa.free(token);
         // deinit stops the listener, wakes waiting calls, and joins the
         // workers; false means a stuck connect kept the gateway, which the
-        // operating system reclaims as the process exits.
-        if (s.gw.deinit()) s.gpa.destroy(s.gw);
-        s.creds.deinit();
-        s.gpa.free(s.data_dir);
-        s.cfg_arena.deinit(); // after the gateway: it reads cfg through us
+        // operating system reclaims as the process exits. Everything the
+        // gateway can still reach — the configuration it reads through us
+        // above all — is then left for the same reckoning: freeing it would
+        // be freeing memory a live thread is reading.
+        if (s.gw.deinit()) {
+            s.gpa.destroy(s.gw);
+            s.creds.deinit();
+            s.gpa.free(s.data_dir);
+            s.cfg_arena.deinit();
+        }
         s.gpa.destroy(s);
     }
 

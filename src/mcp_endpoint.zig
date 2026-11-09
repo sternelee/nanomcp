@@ -357,14 +357,15 @@ fn callTool(g: *gateway_mod.Gateway, a: std.mem.Allocator, id: rpc.Id, params: j
     // The gateway's own tool describes the servers, so it never reaches an
     // upstream.
     if (std.mem.eql(u8, name, tools_mod.meta_tool_name)) {
-        const text = gateway_views.metaToolJSON(g, a) catch |err| return toolError(a, id, err);
+        const text = gateway_views.metaToolJSON(g, a) catch |err| return toolError(a, id, err, null);
         var answer: json.J = .object(a);
         answer.put("content", try textResult(a, text));
         answer.put("isError", .boolean(a, false));
         return rpc.result(a, id, answer.v);
     }
 
-    const called = g.callTool(a, name, args) catch |err| return toolError(a, id, err);
+    var detail: ?[]const u8 = null;
+    const called = g.callTool(a, name, args, &detail) catch |err| return toolError(a, id, err, detail);
     var result: json.J = .object(a);
     if (json.getArray(called, "content")) |content| {
         result.put("content", .from(a, .{ .array = content }));
@@ -378,11 +379,13 @@ fn callTool(g: *gateway_mod.Gateway, a: std.mem.Allocator, id: rpc.Id, params: j
     return rpc.result(a, id, result.v);
 }
 
-fn toolError(a: std.mem.Allocator, id: rpc.Id, err: anyerror) ![]u8 {
+fn toolError(a: std.mem.Allocator, id: rpc.Id, err: anyerror, detail: ?[]const u8) ![]u8 {
     const text = switch (err) {
         error.UnknownTool => "that tool does not exist",
         error.NotConnected => "the server of that tool is not connected",
-        else => "the tool failed",
+        // What the upstream said, when it said anything: a model that sees
+        // the reason can react to it, where a bare failure only reads as one.
+        else => detail orelse "the tool failed",
     };
     var result: json.J = .object(a);
     result.put("content", try textResult(a, text));

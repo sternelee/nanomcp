@@ -4,7 +4,7 @@
 五页界面，三种上游 transport，上游 OAuth，自建 OAuth 授权服务器，Market registry 搜索、
 配置导入与菜单栏。
 
-- 平台：macOS、Linux、Windows；nanoui 0.17；零依赖；MIT。
+- 平台：macOS、Linux、Windows；Zig 0.17；nanoui 0.14.9；零依赖；MIT。
 - 每文件 ≤600 行；无 C shim；三平台都要构建。
 - 测试不开真窗口、不发合成输入（`ui.Tester`、`--nanoui-snapshot`、`--nanoui-eval`）。
 - 不轮询；分配的对象要释放（`objc.Pool`）；每个 widget 行为配测试。

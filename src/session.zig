@@ -94,6 +94,10 @@ pub const Session = struct {
     /// Sends a request and waits for its answer. `a` owns the result. A
     /// server that does not answer within `timeout` fails the call.
     pub fn call(s: *Session, a: std.mem.Allocator, method: []const u8, params: json.Value) !json.Value {
+        // A reason left by an earlier refusal must not be read as this call's
+        // reason: the text is only ever written when a request is refused, so
+        // without this a timeout would be blamed on the last thing that broke.
+        s.clearError();
         const id = try s.begin();
         const bytes = try rpc.request(a, .{ .number = id }, method, params);
         defer a.free(bytes);
@@ -227,6 +231,17 @@ pub const Session = struct {
         const owned = s.a.dupe(u8, message) catch return;
         if (s.last_error) |old| s.a.free(old);
         s.last_error = owned;
+    }
+
+    /// Forgets what the last refusal said, so a new call cannot be blamed for
+    /// an old one's reason.
+    fn clearError(s: *Session) void {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
+        if (s.last_error) |old| {
+            s.a.free(old);
+            s.last_error = null;
+        }
     }
 
     /// What the last refused request said, or null. The borrow is only good

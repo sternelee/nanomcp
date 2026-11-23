@@ -373,6 +373,12 @@ pub const Gateway = struct {
                 if (up.sess.errorText()) |message| {
                     if (detail) |d| d.* = try std.fmt.allocPrint(a, "{s}: {s}", .{ g.serverName(entry.server_id), message });
                 }
+            } else if (err == error.BadStatus) {
+                // A refused request leaves only its status behind, and a bare
+                // "the tool failed" hides the one fact that explains it.
+                if (up.lastStatus()) |code| {
+                    if (detail) |d| d.* = try std.fmt.allocPrint(a, "{s}: the server answered HTTP {d}", .{ g.serverName(entry.server_id), code });
+                }
             }
             return err;
         };

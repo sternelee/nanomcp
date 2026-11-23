@@ -385,7 +385,9 @@ fn toolError(a: std.mem.Allocator, id: rpc.Id, err: anyerror, detail: ?[]const u
         error.NotConnected => "the server of that tool is not connected",
         // What the upstream said, when it said anything: a model that sees
         // the reason can react to it, where a bare failure only reads as one.
-        else => detail orelse "the tool failed",
+        // When nothing said anything, the error's own name is still more than
+        // "the tool failed": it tells a timeout from a closed connection.
+        else => detail orelse try std.fmt.allocPrint(a, "the tool failed ({s})", .{@errorName(err)}),
     };
     var result: json.J = .object(a);
     result.put("content", try textResult(a, text));
@@ -566,4 +568,25 @@ test "closing every stream frees the list that held them" {
     sessions.closeAll();
     try std.testing.expectEqual(@as(usize, 0), sessions.live.items.len);
     try std.testing.expect(stream.closed);
+}
+
+test "a failure with nothing to say still names what went wrong" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    // A timeout has no upstream words to pass on, so the error's own name is
+    // the only thing that tells it from a closed connection. "the tool failed"
+    // alone would read the same for both.
+    const timed_out = try toolError(a, .{ .number = 1 }, error.TimedOut, null);
+    const parsed = rpc.Message.parse(a, timed_out);
+    try std.testing.expect(json.getBool(parsed.response.result, "isError").?);
+    const blocks = json.getArray(parsed.response.result, "content").?;
+    try std.testing.expectEqualStrings("the tool failed (TimedOut)", json.getString(blocks.items[0], "text").?);
+
+    // What the upstream said still wins, when it said anything.
+    const explained = try toolError(a, .{ .number = 2 }, error.ProtocolError, "Files: upstream exploded");
+    const said = rpc.Message.parse(a, explained);
+    const said_blocks = json.getArray(said.response.result, "content").?;
+    try std.testing.expectEqualStrings("Files: upstream exploded", json.getString(said_blocks.items[0], "text").?);
 }

@@ -224,6 +224,18 @@ pub const Upstream = struct {
         return u.sess.call(a, "tools/call", .{ .object = params });
     }
 
+    /// The HTTP status of the last answer, when the transport is HTTP. Null
+    /// for a stdio server, and for the older SSE transport, which keeps no
+    /// status. A refused call leaves nothing else behind, so this is what
+    /// says why it failed.
+    pub fn lastStatus(u: *Upstream) ?u16 {
+        return switch (u.link) {
+            .stdio => null,
+            .http => |t| t.last_status,
+            .sse => null,
+        };
+    }
+
     /// The names of the tools the server published.
     pub fn toolNames(u: *Upstream, a: std.mem.Allocator) ![]const []const u8 {
         const names = try a.alloc([]const u8, u.tools.len);

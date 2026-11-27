@@ -396,3 +396,52 @@ test "the remove dialog's description wraps inside the dialog" {
     // The dialog is 400 points wide, with 20 points of padding each side.
     try std.testing.expectApproxEqAbs(@as(f32, 360), r.w, 1);
 }
+
+/// The box a grid card is drawn in: the only boxes 280 by 128 on the page.
+fn cardBox(t: *ui.Tester, nth: usize) ?struct { rect: ui.Rect, index: u32 } {
+    var seen: usize = 0;
+    for (t.ctx.nodes.items, 0..) |n, i| {
+        const w = n.style.width;
+        const h = n.style.height;
+        if (w != .px or h != .px or w.px != 280 or h.px != 128) continue;
+        if (seen == nth) return .{ .rect = n.rect, .index = @intCast(i) };
+        seen += 1;
+    }
+    return null;
+}
+
+/// The top of the box that scrolls around a node.
+fn scrollTop(t: *ui.Tester, start: u32) f32 {
+    var i = start;
+    while (t.ctx.nodes.items[i].parent != std.math.maxInt(u32)) {
+        i = t.ctx.nodes.items[i].parent;
+        if (t.ctx.nodes.items[i].style.scroll) return t.ctx.nodes.items[i].rect.y;
+    }
+    return -std.math.inf(f32);
+}
+
+test "a grid card lifts under the pointer and keeps its top inside the list" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{ ui_test.stdioServer(), ui_test.secondRemoteServer() });
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    try t.clickText("Grid");
+    t.frame();
+    const rest = cardBox(&t, 0) orelse return error.CardNotFound;
+    // The first card starts below the top of the list, not on it.
+    try std.testing.expect(rest.rect.y > scrollTop(&t, rest.index));
+
+    const name = t.findText("Filesystem") orelse return error.TextNotFound;
+    t.moveTo(name.x + name.w / 2, name.y + name.h / 2);
+    t.settle(1);
+    const lifted = cardBox(&t, 0) orelse return error.CardNotFound;
+    try std.testing.expectApproxEqAbs(rest.rect.y - 3, lifted.rect.y, 0.5);
+
+    // Lifted, it is still inside the list: the top is not cut away.
+    try std.testing.expect(lifted.rect.y >= scrollTop(&t, lifted.index));
+}

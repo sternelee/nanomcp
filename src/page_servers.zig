@@ -39,7 +39,10 @@ pub fn page(c: *ui.Context, s: *App, k: theme.Colors) void {
 
     toolbar(c, s, k, list);
 
-    const body = ui.div(c).column().wFull().grow().scrollY().px(20).pb(20).gap(10);
+    // A card lifts three points under the pointer, and the scrolling body
+    // clips at its top edge: the first row needs that much room above it.
+    var body = ui.div(c).column().wFull().grow().scrollY().px(20).pb(20).gap(10);
+    if (s.servers.grid) body = body.pt(4);
     if (shown.len == 0) {
         noMatch(c, s, k);
     } else if (s.servers.grid) {

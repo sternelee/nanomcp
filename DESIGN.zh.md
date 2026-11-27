@@ -325,6 +325,7 @@ stderr 日志：最多 50 行，单行超过 512 字节截断并加 `"..."`；�
 - 过滤：Name/Alias/Transport/Command/URL，小写包含匹配。
 - 行高 56：单击选中、双击编辑；头像、名称、详情、状态胶囊、transport 徽章、
   工具数（右对齐 54）；OAuth 服务器可 Connect/Disconnect；启用开关。
+- Grid：卡片 280×128，悬停上移 3pt；滚动区顶部留 4pt，抬起的卡片不会被上边缘裁掉。
 - 详情：错误优先；stdio 显示 command + args，否则显示 URL；前缀
   `"Off · "`、`"Connecting · "`、`"Sign in required · "`。
   可登录条件：非 stdio、无 token header，且（OAuth、已登录或 needs-auth）。

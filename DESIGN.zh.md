@@ -366,13 +366,17 @@ stderr 日志：最多 50 行，单行超过 512 字节截断并加 `"..."`；�
 
 ### Settings 页
 
-四张卡：
+五张卡（Startup 只有 macOS 有）：
 
 - Callers：Off/Token/Token + OAuth 分段与说明文案；需要 token 时显示只读 token、
   `"Send it as: Authorization: Bearer <token>"`、复制、重新生成；授权服务器时显示
   discovery URL、已签发数量、全部吊销。
 - Serve：端口 1..65535、保存、启动/停止、状态胶囊；启动时忙提示
   `"Starting the gateway…"`。
+- Startup（仅 macOS）：Open at login 开关。开→在 `~/Library/LaunchAgents/` 写
+  `com.justrach.nanomcp.plist`（`RunAtLoad`、`LimitLoadToSessionType=Aqua`，程序为当前
+  可执行文件的绝对路径，先写临时文件再 rename）；关→删除该文件。开关状态以文件是否存在
+  为准，所以在别处关掉的登录项不会被界面报成开。
 - Endpoints：`/mcp`、`/sse`、`/message`、`/healthz` 及复制；
   客户端配置 `{"mcpServers":{"gateway":{"url":BaseURL + "/mcp"}}}`。
 - Activity：最近 100 条事件倒序，时间 `15:04:05` 等宽；错误红字。

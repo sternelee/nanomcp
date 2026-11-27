@@ -1,6 +1,7 @@
 //! Settings page: the gateway's port and switch, which callers it lets in,
 //! the URLs a client is given, and what the gateway has done.
 const std = @import("std");
+const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
@@ -23,6 +24,11 @@ pub fn page(c: *ui.Context, s: *App, k: theme.Colors) void {
         const card = kit.card(c, k);
         defer card.end();
         gateway(c, s, k);
+    }
+    if (comptime builtin.os.tag == .macos) {
+        const card = kit.card(c, k);
+        defer card.end();
+        startup(c, s, k);
     }
     {
         const card = kit.card(c, k);
@@ -75,6 +81,29 @@ fn gateway(c: *ui.Context, s: *App, k: theme.Colors) void {
         .size = 11,
         .color = k.tertiary,
     });
+}
+
+/// Whether logging in starts the gateway: for a gateway that should be up
+/// before the first agent asks for it, rather than when its window is opened.
+fn startup(c: *ui.Context, s: *App, k: theme.Colors) void {
+    kit.cardTitle(c, "play.fill", "Startup", k.blue);
+
+    const row = ui.div(c).row().wFull().gap(12).itemsCenter().py(2);
+    defer row.end();
+    {
+        // A zero basis that grows: the words take what is left, and the
+        // switch keeps its place at the row's end however long they are.
+        const text = ui.div(c).column().gap(3).grow().w(0).clip();
+        defer text.end();
+        ui.text(c, "Open at login", .{ .size = 11, .weight = .semibold, .color = k.secondary });
+        ui.text(c, "Starts nanomcp when you log in, so the gateway is up before the first agent asks for it.", .{
+            .size = 11,
+            .color = k.tertiary,
+        });
+    }
+
+    var on = s.launchesAtLogin();
+    if (kit.toggle(c, &on)) s.setLaunchAtLogin(on);
 }
 
 /// Saves the port, moving a serving gateway to it.

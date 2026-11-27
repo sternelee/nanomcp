@@ -1,5 +1,6 @@
 //! The nanomcp application state.
 const std = @import("std");
+const builtin = @import("builtin");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 
@@ -8,6 +9,7 @@ pub const credentials = @import("credentials.zig");
 pub const gateway = @import("gateway.zig");
 pub const registry = @import("registry.zig");
 pub const editor = @import("editor.zig");
+pub const login = @import("login.zig");
 
 pub const Page = enum { servers, market, routes, tools, settings };
 
@@ -113,6 +115,10 @@ pub const App = struct {
     /// The token callers present, kept here so a frame can draw it without
     /// reading (and leaking) the credential store each time.
     inbound_token: ?[]u8 = null,
+    /// Where the login item lives and the executable it starts; null on a
+    /// platform without them, or when either path could not be worked out.
+    login_dir: ?[]const u8 = null,
+    login_exe: ?[]const u8 = null,
 
     servers: ServersUi = .{},
     market: MarketUi = .{},
@@ -158,6 +164,14 @@ pub const App = struct {
             .creds = store,
             .gw = undefined,
         };
+
+        // The login item names this executable by its absolute path; the
+        // folder is the user's own, unless a test keeps it in its own tree.
+        if (comptime builtin.os.tag == .macos) {
+            const home = if (test_dir) |td| std.mem.span(td) else homeDir();
+            self.login_dir = login.dirPath(gpa, home) catch null;
+            self.login_exe = executablePath(gpa) catch null;
+        }
 
         // The gateway reads the configuration and credentials through the
         // app's own fields: pointing it at locals would leave it looking at
@@ -207,6 +221,8 @@ pub const App = struct {
             s.gpa.destroy(s.gw);
             s.creds.deinit();
             s.gpa.free(s.data_dir);
+            if (s.login_dir) |dir| s.gpa.free(dir);
+            if (s.login_exe) |exe| s.gpa.free(exe);
             s.cfg_arena.deinit();
         }
         s.gpa.destroy(s);
@@ -227,6 +243,21 @@ pub const App = struct {
         };
     }
 
+    /// The user's home directory, as the environment names it.
+    fn homeDir() []const u8 {
+        const home = std.c.getenv("HOME");
+        return if (home) |hv| std.mem.span(hv) else ".";
+    }
+
+    /// The executable a login item should start: this one, by its absolute
+    /// path, which is what a bundle launches.
+    fn executablePath(a: std.mem.Allocator) ![]u8 {
+        const objc = nanoui.objc;
+        const bundle = objc.msg(objc.Object, objc.class("NSBundle"), "mainBundle", .{});
+        const path = objc.msg(?objc.Object, bundle, "executablePath", .{}) orelse return error.NoExecutable;
+        return a.dupe(u8, objc.fromNSString(path));
+    }
+
     fn homeDataDir(a: std.mem.Allocator) ![]const u8 {
         const home = std.c.getenv("HOME");
         const h = if (home) |hv| try a.dupe(u8, std.mem.span(hv)) else ".";
@@ -239,6 +270,25 @@ pub const App = struct {
             s.notify("save failed", true);
             return;
         };
+    }
+
+    /// Whether logging in starts the app: the login item's file is the whole
+    /// answer, so a switch turned off outside the app is not believed.
+    pub fn launchesAtLogin(s: *Self) bool {
+        const dir = s.login_dir orelse return false;
+        return login.enabled(s.io, dir);
+    }
+
+    /// Puts the login item in place or takes it away, and says so when the
+    /// system would not take it.
+    pub fn setLaunchAtLogin(s: *Self, on: bool) void {
+        const dir = s.login_dir orelse return s.notify("This system has no login items", true);
+        const exe = s.login_exe orelse return s.notify("This system has no login items", true);
+        login.setEnabled(s.io, s.gpa, dir, exe, on) catch {
+            s.notify("The login item could not be changed", true);
+            return;
+        };
+        s.notify(if (on) "Opens at login" else "No longer opens at login", false);
     }
 
     pub fn resync(s: *Self) void {

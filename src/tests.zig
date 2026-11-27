@@ -29,6 +29,7 @@ const modules = .{
     @import("state.zig"),
     @import("menubar.zig"),
     @import("main.zig"),
+    @import("login.zig"),
 };
 
 test {

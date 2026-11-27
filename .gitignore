@@ -8,3 +8,5 @@ zig-pkg
 codedb.snapshot
 .DS_Store
 .pi
+.alma-snapshots
+.perch/

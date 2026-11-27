@@ -70,10 +70,8 @@ fn headerActions(c: *ui.Context, s: *App, k: theme.Colors, selected_id: ?[]const
     if (ui.button(c, "Reconnect", .{ .variant = .secondary, .size = 12, .disabled = !has }).clicked) {
         if (selected_id) |id| actions.reconnect(s, id);
     }
-    if (ui.button(c, "Remove", .{ .variant = .secondary, .size = 12, .disabled = !has }).clicked) {
-        if (selected_id) |id| s.servers.removing = id;
-    }
     if (ui.button(c, "Paste JSON…", .{ .variant = .secondary, .size = 12 }).clicked) actions.openImport(s);
+    if (ui.button(c, "Export…", .{ .variant = .secondary, .size = 12, .disabled = s.cfg.servers.len == 0 }).clicked) actions.openExport(s);
     if (ui.button(c, "Add server…", .{ .variant = .primary, .size = 12 }).clicked) actions.addServer(s);
 }
 

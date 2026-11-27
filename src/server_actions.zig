@@ -4,6 +4,7 @@ const std = @import("std");
 const nanoui = @import("nanoui");
 const config = @import("config.zig");
 const import_mod = @import("import.zig");
+const mcp_export = @import("export.zig");
 const oauth = @import("oauth.zig");
 const editor = @import("editor.zig");
 const state_mod = @import("state.zig");
@@ -275,6 +276,18 @@ pub fn openImport(s: *App) void {
     s.servers.import_text.clear();
     s.servers.import_error = "";
     s.servers.focus_import = true;
+    s.servers.menu = null;
+    s.redisplay();
+}
+
+/// Writes the configured servers the way another MCP client reads them, and
+/// shows the block with a way to copy it.
+pub fn openExport(s: *App) void {
+    s.servers.export_text = mcp_export.write(s.cfgAlloc(), s.cfg.servers) catch {
+        s.notify("Could not write the configuration", true);
+        return;
+    };
+    s.servers.export_open = true;
     s.servers.menu = null;
     s.redisplay();
 }

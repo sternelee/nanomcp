@@ -112,6 +112,17 @@ API：上游 token 的读/判断/写；入站 token 的读/写；client 凭据
 - 摘要：`"Nothing was imported"`、`"Imported N server(s)"`、`"Updated N server(s)"`、
   `"Imported X and updated Y"`。
 
+### 导出
+
+- 页头 `Export…`（没有服务器时禁用）→ 弹窗 `"Export configuration"`：说明文案、
+  等宽可滚动的 JSON、`Close` 与 `Copy JSON`（复制后关闭并提示 `"Configuration copied"`）。
+- 形状与导入相反：`{"mcpServers": {<name>: {...}}}`，缩进 2、末尾换行。
+  - 总是写 `type`（`stdio`/`sse`/`http`，或未知 transport 的原名）。
+  - stdio 写 `command`、非空 `args`；`env` 写成对象 `{"K": "V"}`（`K=V` 拆开，
+    没有 `=` 的整行作键、值为空）；remote 写 `url`、非空 `headers`、`oauth: true`。
+  - `enabled` 只在 false 时写；重名服务器依次加 `" 2"`、`" 3"` 后缀作键。
+  - 不导出令牌与登录状态：它们只在凭据库里。
+
 ## 网关
 
 ### 基本约定
@@ -306,7 +317,8 @@ stderr 日志：最多 50 行，单行超过 512 字节截断并加 `"..."`；�
 
 ### Servers 页
 
-- 页头：spinner（忙时）、Edit、Reconnect、Remove、Paste JSON…、Add server…。
+- 页头：spinner（忙时）、Edit、Reconnect、Paste JSON…、Export…、Add server…。
+  没有 Remove：删除在行的 … 菜单里，只对那一行生效。
 - 空态：`"No servers yet"`。
 - 工具栏：搜索框宽 280 + 摘要 + List/Grid 分段。摘要按 ready/needs-auth/error/disabled
   计数，用 `" · "` 连接。
@@ -401,7 +413,7 @@ stderr 日志：最多 50 行，单行超过 512 字节截断并加 `"..."`；�
 - 全部测试在进程内运行；UI 用 `ui.Tester` 离屏驱动 1080×740 窗口。
 - 每个测试自建 gateway 与内存凭据库，不开窗口；registry 与“打开浏览器”可注入 stub。
 - 用户目录用临时目录隔离；测试不写临时目录之外，不碰剪贴板。
-- 断言覆盖：空态文案、开关语义、过滤、表单校验、导入、令牌轮换、快捷键提示、
+- 断言覆盖：空态文案、开关语义、过滤、表单校验、导入与导出、令牌轮换、快捷键提示、
   颜色（状态胶囊/状态点/卡片悬停与阴影）、减少动效时仍能换页、桌面字号与对比度偏好。
 
 ## 主题

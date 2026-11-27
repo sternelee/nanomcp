@@ -14,6 +14,7 @@ const modules = .{
     @import("transport_sse.zig"),
     @import("upstream.zig"),
     @import("import.zig"),
+    @import("export.zig"),
     @import("tokens.zig"),
     @import("server.zig"),
     @import("registry.zig"),

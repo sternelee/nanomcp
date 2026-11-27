@@ -50,16 +50,55 @@ test "removing a server asks first, then takes it away" {
     try ui_test.openWindow(&t, f, a);
     defer t.deinit();
 
+    // The row's own menu: the header carries no Remove, so a server is only
+    // removed from the row it is in.
+    try ui_test.clickIcon(&t, "ellipsis", 0);
     try t.clickText("Remove");
     try std.testing.expect(t.hasText("Remove \u{201c}Filesystem\u{201d}?"));
     try t.clickText("Cancel");
     try std.testing.expect(ui_test.serverNamed(&f.app, "Filesystem") != null);
 
-    try t.clickText("Remove");
-    try ui_test.clickNth(&t, "Remove", 1);
+    try ui_test.clickIcon(&t, "ellipsis", 0);
+    try t.clickText("Remove"); // the menu's
+    try t.clickText("Remove"); // the question's
     try std.testing.expect(ui_test.serverNamed(&f.app, "Filesystem") == null);
     try std.testing.expect(t.hasText("No servers yet"));
     try std.testing.expect(t.hasText("Filesystem removed"));
+}
+
+test "Export shows the block another client reads, and the header has no Remove" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const f = try Fixture.init(a, &.{ui_test.stdioServer()});
+    defer f.deinit();
+    var t: ui.Tester = undefined;
+    try ui_test.openWindow(&t, f, a);
+    defer t.deinit();
+
+    // Removing a server is the row menu's business now.
+    try std.testing.expectEqual(@as(usize, 0), ui_test.countText(&t, "Remove"));
+
+    try t.clickText("Export…");
+    try std.testing.expect(t.hasText("Export configuration"));
+
+    // The block the dialog shows is the one the action wrote: a wrapper the
+    // importing side reads, with this server in it.
+    const text = f.app.servers.export_text;
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"mcpServers\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"Filesystem\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"command\": \"npx\"") != null);
+    var shown = false;
+    for (t.ctx.nodes.items) |n| switch (n.content) {
+        .text => |tx| if (std.mem.eql(u8, tx.str, text)) {
+            shown = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(shown);
+
+    try t.clickText("Close");
+    try std.testing.expect(!t.hasText("Export configuration"));
 }
 
 test "the add form shows its fields" {
@@ -164,7 +203,7 @@ test "the import area takes a configuration as it opens" {
     try t.clickText("Paste a configuration…");
     // No click: the area is focused when the dialog opens.
     try std.testing.expect(t.ctx.focused_text != null);
-    t.typeText("{\n\"mcpServers\": {\n\"Example\": {\"command\": \"echo\"}\n}\n}");
+    t.typeText("{\n\"mcpServers\": {\n\"Example\": {\"command\": \"npx\"}\n}\n}");
     try t.clickText("Import");
     try std.testing.expect(ui_test.serverNamed(&f.app, "Example") != null);
 }
@@ -218,6 +257,7 @@ test "Escape cancels the removal question" {
     try ui_test.openWindow(&t, f, a);
     defer t.deinit();
 
+    try ui_test.clickIcon(&t, "ellipsis", 0);
     try t.clickText("Remove");
     try std.testing.expect(t.hasText("Remove \u{201c}Filesystem\u{201d}?"));
     t.key(.escape);
@@ -348,6 +388,7 @@ test "the remove dialog's description wraps inside the dialog" {
     try ui_test.openWindow(&t, f, a);
     defer t.deinit();
 
+    try ui_test.clickIcon(&t, "ellipsis", 0);
     try t.clickText("Remove");
     t.frame();
     const r = t.findText("Its tools are withdrawn from the gateway, and its saved sign-in is forgotten.") orelse

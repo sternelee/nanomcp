@@ -49,6 +49,10 @@ pub const ServersUi = struct {
     import_error: []const u8 = "",
     /// Gives the import area the focus as it opens.
     focus_import: bool = false,
+    /// The Export dialog, and the block it shows: written when it opens, and
+    /// kept for as long as it is up.
+    export_open: bool = false,
+    export_text: []const u8 = "",
     removing: ?[]const u8 = null,
     selected: usize = 0,
     menu: ?ServerMenu = null,

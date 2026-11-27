@@ -1,5 +1,6 @@
 //! The Servers page's dialogs: removing a server, pasting a configuration,
-//! and adding or editing one. They open over the whole window.
+//! exporting one, and adding or editing a server. They open over the whole
+//! window.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -28,7 +29,8 @@ const import_placeholder =
 /// Whether a dialog covers the page, so Escape closes it rather than
 /// leaving the page.
 pub fn anyOpen(s: *App) bool {
-    return s.servers.removing != null or s.servers.import_open or s.servers.editing != null;
+    return s.servers.removing != null or s.servers.import_open or
+        s.servers.export_open or s.servers.editing != null;
 }
 
 /// Draws whichever dialog is open, on top of the window.
@@ -42,6 +44,10 @@ pub fn draw(c: *ui.Context, s: *App, k: theme.Colors) void {
     }
     if (s.servers.import_open) {
         importDialog(c, s, k);
+        return;
+    }
+    if (s.servers.export_open) {
+        exportDialog(c, s, k);
         return;
     }
     if (s.servers.editing) |id| editorDialog(c, s, k, id);
@@ -132,6 +138,54 @@ fn importDialog(c: *ui.Context, s: *App, k: theme.Colors) void {
     if (ui.button(c, "Cancel", .{ .variant = .secondary, .size = 13 }).clicked) s.servers.import_open = false;
     const empty = std.mem.trim(u8, s.servers.import_text.text(), " \t\r\n").len == 0;
     if (ui.button(c, "Import", .{ .variant = .primary, .size = 13, .disabled = empty }).clicked) actions.doImport(s);
+}
+
+/// The configured servers as another client reads them: shown whole, with a
+/// copy that leaves the secrets out of it.
+fn exportDialog(c: *ui.Context, s: *App, k: theme.Colors) void {
+    if (scrim(c, k)) {
+        s.servers.export_open = false;
+        return;
+    }
+    const overlay = ui.div(c).absolute().sizeFull().center().px(24).py(40);
+    defer overlay.end();
+    const win = ui.div(c).column().w(520).p(20).rounded(12).bg(k.page).border(k.border).shadowLg().gap(12);
+    defer win.end();
+    _ = win.interaction();
+
+    {
+        const h = ui.div(c).row().wFull().itemsCenter();
+        defer h.end();
+        ui.text(c, "Export configuration", .{ .size = 18, .weight = .bold, .color = k.text });
+        ui.spacer(c);
+        const x = ui.div(c).row().w(26).h(26).center().rounded(7).hover(k.hover).control();
+        ui.icon(c, "xmark", .{ .size = 13, .color = k.secondary });
+        const closed = x.clicked();
+        x.end();
+        if (closed) s.servers.export_open = false;
+    }
+    ui.text(c, "The mcpServers block another client reads as it stands. Saved tokens and sign-ins stay here, so it is safe to share.", .{
+        .size = 12,
+        .color = k.secondary,
+        .wrap = true,
+    });
+
+    ui.text(c, "Configuration", .{ .size = 11, .weight = .semibold, .color = k.tertiary });
+    {
+        const well = ui.div(c).column().wFull().maxH(300).scrollY().p(12).rounded(8).bg(k.well).border(k.border);
+        defer well.end();
+        ui.text(c, s.servers.export_text, .{ .size = 11, .mono = true, .color = k.text, .wrap = true });
+    }
+
+    const buttons = ui.div(c).row().wFull().gap(8).itemsCenter();
+    defer buttons.end();
+    ui.spacer(c);
+    if (ui.button(c, "Close", .{ .variant = .secondary, .size = 13 }).clicked) s.servers.export_open = false;
+    if (ui.button(c, "Copy JSON", .{ .variant = .primary, .size = 13 }).clicked) {
+        c.clipboard.write(c.clipboard.ctx, s.servers.export_text);
+        s.servers.export_open = false;
+        s.notify("Configuration copied", false);
+    }
 }
 
 fn editorDialog(c: *ui.Context, s: *App, k: theme.Colors, id: []const u8) void {
